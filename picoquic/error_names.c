@@ -117,6 +117,7 @@ char const* picoquic_error_name(uint64_t error_code)
     case PICOQUIC_ERROR_PATH_LIMIT_EXCEEDED: e_name = "path limit exceeded"; break;
     case PICOQUIC_ERROR_REDIRECTED: e_name = "redirected to proxy (not an error)"; break; /* Not an error: the packet was captured by a proxy, no further processing needed */
     case PICOQUIC_ERROR_PADDING_PACKET: e_name = "padding_packet"; break; /* Random bytes at end of datagram */
+    case PICOQUIC_ERROR_TLS_CONFIG_FROZEN: e_name = "tls config frozen"; break;
     default:
         if (error_code > 0x100 && error_code < 0x200) {
             /* Protocol errors defined in the QUIC spec */

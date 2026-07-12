@@ -400,6 +400,15 @@ void picoquic_test_simlink_suspend(picoquictest_sim_link_t* link, uint64_t time_
 #define PICOQUIC_TEST_FILE_CLIENT_CERT_ED25519 "certs\\mtls_ed25519\\client.crt"
 #define PICOQUIC_TEST_FILE_CLIENT_KEY_ED25519 "certs\\mtls_ed25519\\client.key"
 #define PICOQUIC_TEST_FILE_CERT_STORE_ED25519 "certs\\mtls_ed25519\\ca.crt"
+#define PICOQUIC_TEST_FILE_SNI_CERT_STORE "certs\\sni\\ca.crt"
+#define PICOQUIC_TEST_FILE_SNI_CERT_DEFAULT "certs\\sni\\default.crt"
+#define PICOQUIC_TEST_FILE_SNI_KEY_DEFAULT "certs\\sni\\default.key"
+#define PICOQUIC_TEST_FILE_SNI_CERT_ALPHA "certs\\sni\\alpha.crt"
+#define PICOQUIC_TEST_FILE_SNI_KEY_ALPHA "certs\\sni\\alpha.key"
+#define PICOQUIC_TEST_FILE_SNI_CERT_BETA "certs\\sni\\beta.crt"
+#define PICOQUIC_TEST_FILE_SNI_KEY_BETA "certs\\sni\\beta.key"
+#define PICOQUIC_TEST_FILE_SNI_CLIENT_CERT "certs\\sni\\client.crt"
+#define PICOQUIC_TEST_FILE_SNI_CLIENT_KEY "certs\\sni\\client.key"
 #else
 #define PICOQUIC_TEST_FILE_SERVER_CERT "certs/cert.pem"
 #define PICOQUIC_TEST_FILE_SERVER_BAD_CERT "certs/badcert.pem"
@@ -420,6 +429,15 @@ void picoquic_test_simlink_suspend(picoquictest_sim_link_t* link, uint64_t time_
 #define PICOQUIC_TEST_FILE_CLIENT_CERT_ED25519 "certs/mtls_ed25519/client.crt"
 #define PICOQUIC_TEST_FILE_CLIENT_KEY_ED25519 "certs/mtls_ed25519/client.key"
 #define PICOQUIC_TEST_FILE_CERT_STORE_ED25519 "certs/mtls_ed25519/ca.crt"
+#define PICOQUIC_TEST_FILE_SNI_CERT_STORE "certs/sni/ca.crt"
+#define PICOQUIC_TEST_FILE_SNI_CERT_DEFAULT "certs/sni/default.crt"
+#define PICOQUIC_TEST_FILE_SNI_KEY_DEFAULT "certs/sni/default.key"
+#define PICOQUIC_TEST_FILE_SNI_CERT_ALPHA "certs/sni/alpha.crt"
+#define PICOQUIC_TEST_FILE_SNI_KEY_ALPHA "certs/sni/alpha.key"
+#define PICOQUIC_TEST_FILE_SNI_CERT_BETA "certs/sni/beta.crt"
+#define PICOQUIC_TEST_FILE_SNI_KEY_BETA "certs/sni/beta.key"
+#define PICOQUIC_TEST_FILE_SNI_CLIENT_CERT "certs/sni/client.crt"
+#define PICOQUIC_TEST_FILE_SNI_CLIENT_KEY "certs/sni/client.key"
 #endif
 
  /* To set the solution directory for tests */

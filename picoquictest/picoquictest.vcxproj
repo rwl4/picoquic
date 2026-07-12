@@ -198,6 +198,7 @@
     <ClCompile Include="sacktest.c" />
     <ClCompile Include="satellite_test.c" />
     <ClCompile Include="skip_frame_test.c" />
+    <ClCompile Include="sni_test.c" />
     <ClCompile Include="socket_test.c" />
     <ClCompile Include="cplusplus.cpp" />
     <ClCompile Include="sockloop_test.c" />

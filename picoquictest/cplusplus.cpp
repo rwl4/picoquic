@@ -28,6 +28,12 @@
 #include "picoquic.h"
 #include "picoquic_lb.h"
 #include "picohash.h"
+
+/* Source compatibility from C++: the historical verify-certificate
+ * setter keeps its exact void signature. */
+static void (*picoquic_test_legacy_verify_setter)(picoquic_quic_t*,
+    ptls_verify_certificate_t*, picoquic_free_verify_certificate_ctx) =
+    picoquic_set_verify_certificate_callback;
 #include "picoquic_internal.h"
 #include "picoquic_utils.h"
 #include "picosocks.h"
@@ -42,6 +48,7 @@
 
 extern "C" {
     int cplusplustest(void) {
+        (void)picoquic_test_legacy_verify_setter;
         return 0;
     }
 }

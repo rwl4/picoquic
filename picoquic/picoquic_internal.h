@@ -519,6 +519,14 @@ typedef struct st_picoquic_ticket_key_state_t {
 
 typedef struct st_picoquic_quic_t {
     void* tls_master_ctx;
+    /* SSL key log sink, shared by every TLS context of this QUIC
+     * context (master, SNI identities, refreshed fallback contexts).
+     * Owned by the QUIC context; the FILE is closed exactly once. */
+    struct st_picoquic_log_event_t* keylog_sink;
+    /* Registry of live verifier ownership records, so one verify
+     * callback pointer never acquires two independent cleanup records
+     * within this QUIC context. */
+    struct st_picoquic_tls_verifier_ref_t* verifier_ref_first;
     picoquic_stream_data_cb_fn default_callback_fn;
     void* default_callback_ctx;
     struct st_picomask_ctx_t* picomask_ctx;
@@ -527,6 +535,11 @@ typedef struct st_picoquic_quic_t {
     char* tls_cert_root_file_name;
     picoquic_alpn_select_fn alpn_select_fn;
     picoquic_alpn_select_fn_v2 alpn_select_fn_v2;
+    struct st_picoquic_server_identity_t* server_identity_first;
+    struct st_picoquic_sni_registry_entry_t* sni_registry_first;
+    picoquic_server_identity_select_fn server_identity_select_fn;
+    void* server_identity_select_ctx;
+    picoquic_server_resumption_scope_t default_resumption_scope;
     uint8_t reset_seed[PICOQUIC_RESET_SECRET_SIZE];
     uint8_t retry_seed[PICOQUIC_RETRY_SECRET_SIZE];
     uint64_t* p_simulated_time;
@@ -568,6 +581,8 @@ typedef struct st_picoquic_quic_t {
     unsigned int client_zero_share : 1;
     unsigned int server_busy : 1;
     unsigned int is_cert_store_not_empty : 1;
+    unsigned int tls_config_frozen : 1; /* Server identities exist; context-wide TLS config is frozen */
+    unsigned int sni_resumption_scoping : 1; /* SNI selection was enabled; tickets carry a resumption scope. Sticky. */
     unsigned int use_long_log : 1;
     unsigned int should_close_log : 1;
     unsigned int enable_sslkeylog : 1; /* Enable the SSLKEYLOG feature */
@@ -628,7 +643,6 @@ typedef struct st_picoquic_quic_t {
     void ** retry_integrity_verify_ctx;
 
     struct st_ptls_verify_certificate_t * verify_certificate_callback;
-    picoquic_free_verify_certificate_ctx free_verify_certificate_callback_fn;
 
     picoquic_tp_t default_tp;
 
@@ -1307,10 +1321,17 @@ typedef struct st_picoquic_cnx_t {
     uint64_t issued_ticket_id;
     uint64_t resumed_ticket_id;
 
-    /* On clients, document the SNI and ALPN expected from the server */
+    /* On clients, document the SNI and ALPN expected from the server.
+     * On servers, the SNI accepted from the ClientHello. */
     /* TODO: there may be a need to propose multiple ALPN */
     char const* sni;
     char const* alpn;
+    /* On servers, the application context of the server identity
+     * (virtual host) selected for the connection, if any, and the
+     * resumption scope selected during ClientHello processing (used to
+     * authenticate session tickets when SNI scoping is enabled). */
+    void* server_name_ctx;
+    picoquic_server_resumption_scope_t resumption_scope;
     /* On clients, receives the maximum 0RTT size accepted by server */
     size_t max_early_data_size;
     /* Call back function and context */

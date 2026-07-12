@@ -87,17 +87,99 @@ struct st_picoquic_log_event_t {
     FILE* fp;
 };
 
+/* Shared ownership of the certificate verification policy. Every TLS
+ * context cloned from the master (SNI identities and refreshed
+ * fallback contexts) points at the exact same ptls_verify_certificate_t as the
+ * master, so custom verifiers and trust-store mutations apply
+ * identically everywhere. The reference count tracks how many
+ * picoquic_tls_master_ref_t own a share; an owned verifier's cleanup
+ * callback runs exactly once, when the last share is released. A NULL
+ * free_fn marks a borrowed verifier that picoquic never frees. */
+struct st_picoquic_tls_verifier_ref_t {
+    struct st_picoquic_tls_verifier_ref_t* next;
+    picoquic_quic_t* quic;
+    struct st_ptls_verify_certificate_t* verifier;
+    picoquic_free_verify_certificate_ctx free_fn;
+    uint32_t ref_count;
+};
+
+typedef struct st_picoquic_tls_verifier_ref_t picoquic_tls_verifier_ref_t;
+
+/* Live records are registered on their QUIC context, so a callback
+ * pointer that is still owned somewhere, for instance by an old TLS
+ * context retained by a live connection after a certificate refresh, can be
+ * found and reused instead of acquiring a second, independent cleanup
+ * record. Records unlink themselves before their final cleanup, so an
+ * unused verifier is still disposed promptly. */
+static picoquic_tls_verifier_ref_t* picoquic_tls_verifier_ref_find(
+    picoquic_quic_t* quic, struct st_ptls_verify_certificate_t* verifier)
+{
+    picoquic_tls_verifier_ref_t* ref = quic->verifier_ref_first;
+
+    while (ref != NULL && ref->verifier != verifier) {
+        ref = ref->next;
+    }
+
+    return ref;
+}
+
+static picoquic_tls_verifier_ref_t* picoquic_tls_verifier_ref_create(
+    picoquic_quic_t* quic, struct st_ptls_verify_certificate_t* verifier,
+    picoquic_free_verify_certificate_ctx free_fn)
+{
+    picoquic_tls_verifier_ref_t* ref =
+        (picoquic_tls_verifier_ref_t*)calloc(1, sizeof(picoquic_tls_verifier_ref_t));
+
+    if (ref != NULL) {
+        ref->quic = quic;
+        ref->verifier = verifier;
+        ref->free_fn = free_fn;
+        ref->ref_count = 1;
+        ref->next = quic->verifier_ref_first;
+        quic->verifier_ref_first = ref;
+    }
+
+    return ref;
+}
+
+static void picoquic_tls_verifier_ref_addref(picoquic_tls_verifier_ref_t* ref)
+{
+    if (ref != NULL) {
+        ref->ref_count++;
+    }
+}
+
+static void picoquic_tls_verifier_ref_release(picoquic_tls_verifier_ref_t* ref)
+{
+    if (ref != NULL && ref->ref_count > 0 && --ref->ref_count == 0) {
+        picoquic_tls_verifier_ref_t** pnext = &ref->quic->verifier_ref_first;
+
+        while (*pnext != NULL) {
+            if (*pnext == ref) {
+                *pnext = ref->next;
+                break;
+            }
+            pnext = &(*pnext)->next;
+        }
+        if (ref->free_fn != NULL && ref->verifier != NULL) {
+            ref->free_fn(ref->verifier);
+        }
+        free(ref);
+    }
+}
+
 typedef struct st_picoquic_tls_master_ref_t {
     ptls_update_open_count_t open_count;
     picoquic_quic_t* quic;
     ptls_context_t* ctx;
-    picoquic_free_verify_certificate_ctx free_verify_certificate_callback_fn;
+    picoquic_tls_verifier_ref_t* verifier_ref;
     uint32_t ref_count;
 } picoquic_tls_master_ref_t;
 
 static void picoquic_tls_master_ref_release(picoquic_tls_master_ref_t* ref);
 static picoquic_tls_master_ref_t* picoquic_tls_master_ref_from_ctx(ptls_context_t* ctx);
-static void picoquic_free_log_event_ctx(ptls_context_t* ctx);
+static void picoquic_log_event_call_back(ptls_log_event_t* _self, ptls_t* tls, const char* type, const char* fmt, ...);
+static int picoquic_sni_validate_name(const uint8_t* name, size_t name_length);
 
 
 /* This first part of this file provides a set of function for accessing
@@ -587,6 +669,9 @@ int picoquic_set_cipher_suite(picoquic_quic_t* quic, int cipher_suite_id)
 {
     ptls_context_t* ctx;
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_cipher_suite")) {
+        return PICOQUIC_ERROR_TLS_CONFIG_FROZEN;
+    }
     ctx = (ptls_context_t*)quic->tls_master_ctx;
     return (picoquic_set_cipher_suite_in_ctx(ctx, cipher_suite_id, quic->use_low_memory));
 }
@@ -734,6 +819,9 @@ int picoquic_set_key_exchange(picoquic_quic_t* quic, int key_exchange_id)
     int ret = 0;
     ptls_context_t* ctx;
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_key_exchange")) {
+        return PICOQUIC_ERROR_TLS_CONFIG_FROZEN;
+    }
     ctx = (ptls_context_t*)quic->tls_master_ctx;
 
     ret = picoquic_set_key_exchange_in_ctx(ctx, key_exchange_id);
@@ -769,6 +857,10 @@ static int set_private_key_from_file(char const* keypem, ptls_context_t* ctx)
 
 int picoquic_set_private_key_from_file(picoquic_quic_t* quic, char const* file_name)
 {
+    PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_private_key_from_file")) {
+        return PICOQUIC_ERROR_TLS_CONFIG_FROZEN;
+    }
     return set_private_key_from_file(file_name, quic->tls_master_ctx);
 }
 
@@ -827,6 +919,9 @@ int picoquic_set_tls_root_certificates(picoquic_quic_t* quic, ptls_iovec_t* cert
 {
     int ret = -1;
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_tls_root_certificates")) {
+        return PICOQUIC_ERROR_TLS_CONFIG_FROZEN;
+    }
 
     if (picoquic_set_tls_root_certificates_fn != NULL) {
         if ((ret = picoquic_set_tls_root_certificates_fn(quic->tls_master_ctx, certs, count)) == 0){
@@ -1153,12 +1248,19 @@ int picoquic_tls_collected_extensions_cb(ptls_t* UNUSED(tls), ptls_handshake_pro
 }
 
 /*
- * The Hello Call Back is called on the server side upon reception of the 
+ * The Hello Call Back is called on the server side upon reception of the
  * Client Hello. The picotls code will parse the client hello and retrieve
- * parameters such as SNI and proposed ALPN.
- * TODO: check the SNI in case several are supported.
+ * parameters such as SNI and proposed ALPN. The callback selects the
+ * server identity (TLS context) for the connection, through the
+ * application selector and/or the SNI registry, falling back to the
+ * default context, and then checks the proposed ALPN.
  * TODO: check the ALPN in case several are supported.
  */
+
+static int picoquic_server_identity_resolve(picoquic_quic_t* quic, picoquic_cnx_t* cnx,
+    ptls_on_client_hello_parameters_t* params, int sni_present,
+    ptls_context_t** selected_ctx, void** server_name_ctx,
+    picoquic_server_resumption_scope_t* resumption_scope, char const** selection_source);
 
 int picoquic_client_hello_call_back(ptls_on_client_hello_t* on_hello_cb_ctx,
     ptls_t* tls, ptls_on_client_hello_parameters_t *params)
@@ -1168,9 +1270,81 @@ int picoquic_client_hello_call_back(ptls_on_client_hello_t* on_hello_cb_ctx,
     int ret = 0;
     picoquic_quic_t** ppquic = (picoquic_quic_t**)(((char*)on_hello_cb_ctx) + sizeof(ptls_on_client_hello_t));
     picoquic_quic_t* quic = *ppquic;
+    picoquic_cnx_t* cnx = (picoquic_cnx_t*)*ptls_get_data_ptr(tls);
+    int sni_present = 0;
+    int sni_valid = 0;
+    ptls_context_t* selected_ctx = NULL;
+    void* server_name_ctx = NULL;
+    picoquic_server_resumption_scope_t resumption_scope;
+    char const* selection_source = "default";
 
-    /* Save the server name */
-    ptls_set_server_name(tls, (const char *)params->server_name.base, params->server_name.len);
+    memset(&resumption_scope, 0, sizeof(resumption_scope));
+
+    /* Validate the server name before treating it as a host name.
+     * Strict validation only applies once SNI identity selection has
+     * been enabled on this context (a sticky property, like the
+     * resumption scoping it accompanies); a server that never
+     * configured SNI selection keeps the legacy behavior of accepting
+     * arbitrary SNI values on the wire. */
+    if (params->server_name.base != NULL) {
+        sni_present = 1;
+        sni_valid = (picoquic_sni_validate_name(params->server_name.base,
+            params->server_name.len) == 0);
+        if (!sni_valid && quic->sni_resumption_scoping) {
+            if (cnx != NULL) {
+                picoquic_log_app_message(cnx, "%s", "Malformed SNI in client hello");
+            }
+            return PTLS_ALERT_ILLEGAL_PARAMETER;
+        }
+    }
+
+    /* Select the server identity, before picotls picks the certificate
+     * and before it evaluates offered PSKs (the resumption scope must
+     * be in place when session tickets are decrypted). */
+    ret = picoquic_server_identity_resolve(quic, cnx, params, sni_present,
+        &selected_ctx, &server_name_ctx, &resumption_scope, &selection_source);
+    if (ret != 0) {
+        return ret;
+    }
+    if (cnx != NULL && quic->sni_resumption_scoping) {
+        cnx->resumption_scope = resumption_scope;
+    }
+    if (selected_ctx != NULL && selected_ctx != ptls_get_context(tls)) {
+        ptls_set_context(tls, selected_ctx);
+    }
+
+    /* Save the server name. The saved name underpins the HRR
+     * consistency check and the ticket binding in picotls, so a
+     * failure to save it must fail the handshake. */
+    if (sni_present) {
+        if (ptls_set_server_name(tls, (const char *)params->server_name.base,
+            params->server_name.len) != 0) {
+            return PTLS_ALERT_INTERNAL_ERROR;
+        }
+        /* The C-string convenience copy is only made for validated
+         * names. A legacy nonconforming name stays visible through
+         * picoquic_tls_get_sni(), the picotls-backed accessor; a name
+         * with an embedded NUL cannot be fully represented by either
+         * C-string view and is never copied here. */
+        if (cnx != NULL && cnx->sni == NULL && sni_valid) {
+            cnx->sni = picoquic_string_create((const char*)params->server_name.base,
+                params->server_name.len);
+            if (cnx->sni == NULL) {
+                return PTLS_ALERT_INTERNAL_ERROR;
+            }
+        }
+    }
+    if (cnx != NULL) {
+        cnx->server_name_ctx = server_name_ctx;
+        /* Only log when identity selection is configured, so servers
+         * without virtual hosts keep their exact log output. */
+        if (sni_present && (quic->server_identity_select_fn != NULL ||
+            quic->sni_registry_first != NULL)) {
+            picoquic_log_app_message(cnx, "SNI %.*s, identity: %s",
+                (int)params->server_name.len, (const char*)params->server_name.base,
+                selection_source);
+        }
+    }
 
     /* Check if the client is proposing the expected ALPN */
     if (quic->default_alpn != NULL) {
@@ -1178,8 +1352,8 @@ int picoquic_client_hello_call_back(ptls_on_client_hello_t* on_hello_cb_ctx,
 
         for (size_t i = 0; i < params->negotiated_protocols.count; i++) {
             if (params->negotiated_protocols.list[i].len == len && memcmp(params->negotiated_protocols.list[i].base, quic->default_alpn, len) == 0) {
-                if (quic->cnx_in_progress != NULL) {
-                    picoquic_log_app_message(quic->cnx_in_progress, "ALPN[%d] matches default alpn (%s)", (int)i, quic->default_alpn);
+                if (cnx != NULL) {
+                    picoquic_log_app_message(cnx, "ALPN[%d] matches default alpn (%s)", (int)i, quic->default_alpn);
                 }
                 alpn_found = (const uint8_t *)quic->default_alpn;
                 alpn_found_length = len;
@@ -1204,11 +1378,11 @@ int picoquic_client_hello_call_back(ptls_on_client_hello_t* on_hello_cb_ctx,
         }
     }
 
-    if (quic->cnx_in_progress != NULL) {
-        if (quic->cnx_in_progress->alpn == NULL && alpn_found_length > 0) {
-            quic->cnx_in_progress->alpn = picoquic_string_create((const char *)alpn_found, alpn_found_length);
+    if (cnx != NULL) {
+        if (cnx->alpn == NULL && alpn_found_length > 0) {
+            cnx->alpn = picoquic_string_create((const char *)alpn_found, alpn_found_length);
         }
-        picoquic_log_negotiated_alpn(quic->cnx_in_progress,
+        picoquic_log_negotiated_alpn(cnx,
             0, params->server_name.base, params->server_name.len, alpn_found, alpn_found_length,
             params->negotiated_protocols.list, params->negotiated_protocols.count);
     }
@@ -1218,8 +1392,8 @@ int picoquic_client_hello_call_back(ptls_on_client_hello_t* on_hello_cb_ctx,
         ret = PTLS_ALERT_NO_APPLICATION_PROTOCOL;
     }
 
-    if (ret != 0 && quic->cnx_in_progress != NULL) {
-        picoquic_log_app_message(quic->cnx_in_progress, "Client Hello call back returns %d (0x%x)", ret, ret);
+    if (ret != 0 && cnx != NULL) {
+        picoquic_log_app_message(cnx, "Client Hello call back returns %d (0x%x)", ret, ret);
     }
 
     return ret;
@@ -1265,12 +1439,8 @@ void picoquic_dispose_ticket_key_state(picoquic_ticket_key_state_t* key)
 }
 
 int picoquic_server_encrypt_ticket_call_back(ptls_encrypt_ticket_t* encrypt_ticket_ctx,
-    ptls_t* UNUSED(tls), int is_encrypt, ptls_buffer_t* dst, ptls_iovec_t src)
+    ptls_t* tls, int is_encrypt, ptls_buffer_t* dst, ptls_iovec_t src)
 {
-#ifdef _WINDOWS
-    UNREFERENCED_PARAMETER(tls);
-#endif
-
     /* Assume that the keys are in the quic context 
      * The tickets are composed of a 64 bit "sequence number" 
      * followed by the result of the clear text encryption.
@@ -1278,8 +1448,16 @@ int picoquic_server_encrypt_ticket_call_back(ptls_encrypt_ticket_t* encrypt_tick
     int ret = 0;
     picoquic_quic_t** ppquic = (picoquic_quic_t**)(((char*)encrypt_ticket_ctx) + sizeof(ptls_encrypt_ticket_t));
     picoquic_quic_t* quic = *ppquic;
-    uint8_t param_verif[56];
+    picoquic_cnx_t* cnx = (tls == NULL) ? NULL : (picoquic_cnx_t*)*ptls_get_data_ptr(tls);
+    uint8_t param_verif[56 + PICOQUIC_SERVER_RESUMPTION_SCOPE_SIZE];
     uint8_t* param_bytes = param_verif;
+    size_t param_verif_length = 56;
+
+    if (cnx == NULL) {
+        /* The connection carries the resumption scope and the version;
+         * without it, neither issue nor accept tickets. */
+        return -1;
+    }
 
     /* Encode summary of default TLS parameters in a binary token that
     * will be used as aead. This ensure that tokens issue with different
@@ -1299,6 +1477,18 @@ int picoquic_server_encrypt_ticket_call_back(ptls_encrypt_ticket_t* encrypt_tick
     param_bytes += 8;
     picoformat_64(param_bytes, quic->default_tp.initial_max_stream_id_unidir);
 
+    /* When SNI identity selection is enabled, bind the ticket to the
+     * resumption scope selected for the connection during ClientHello
+     * processing. A ticket issued under one scope then fails AEAD
+     * verification under any other, including the legacy unscoped
+     * binding, forcing a full handshake and the rejection of 0-RTT
+     * data, so a resumption can never cross a virtual-host boundary. */
+    if (quic->sni_resumption_scoping) {
+        memcpy(param_verif + param_verif_length, cnx->resumption_scope.id,
+            PICOQUIC_SERVER_RESUMPTION_SCOPE_SIZE);
+        param_verif_length += PICOQUIC_SERVER_RESUMPTION_SCOPE_SIZE;
+    }
+
     if (is_encrypt != 0) {
         picoquic_ticket_key_state_t* key = &quic->ticket_key_state[quic->ticket_key_state_active_slot];
         /* Encoding*/
@@ -1306,7 +1496,7 @@ int picoquic_server_encrypt_ticket_call_back(ptls_encrypt_ticket_t* encrypt_tick
             ret = -1;
         } else if ((ret = ptls_buffer_reserve(dst, 8 + 4 + src.len + PICOQUIC_AEAD_TAG_SIZE(key->aead_encrypt_ctx))) == 0) {
             /* Create and store the ticket sequence number */
-            uint32_t version_number = picoquic_supported_versions[quic->cnx_in_progress->version_index].version;
+            uint32_t version_number = picoquic_supported_versions[cnx->version_index].version;
             uint64_t seq_num = picoquic_ticket_key_random_sequence(quic->ticket_key_state_active_slot);
             size_t start_off;
             size_t data_length;
@@ -1323,9 +1513,9 @@ int picoquic_server_encrypt_ticket_call_back(ptls_encrypt_ticket_t* encrypt_tick
             /* Run AEAD encryption */
             dst->off += picoquic_aead_encrypt_generic(dst->base + dst->off,
                 dst->base + start_off, data_length, seq_num, param_verif,
-                sizeof(param_verif), key->aead_encrypt_ctx);
+                param_verif_length, key->aead_encrypt_ctx);
             /* Remember issued ticket ID in connection context */
-            quic->cnx_in_progress->issued_ticket_id = seq_num;
+            cnx->issued_ticket_id = seq_num;
         }
     } else {
         picoquic_ticket_key_state_t* key = NULL;
@@ -1344,34 +1534,34 @@ int picoquic_server_encrypt_ticket_call_back(ptls_encrypt_ticket_t* encrypt_tick
             /* Decrypt */
             size_t decrypted = picoquic_aead_decrypt_generic(dst->base + dst->off,
                 src.base + 8, cipher_length, seq_num, param_verif,
-                sizeof(param_verif), key->aead_decrypt_ctx);
+                param_verif_length, key->aead_decrypt_ctx);
 
             if (decrypted < 4 || decrypted > cipher_length) {
                 /* decryption error */
                 ret = -1;
-                picoquic_log_app_message(quic->cnx_in_progress, "%s",
+                picoquic_log_app_message(cnx, "%s",
                     "Session ticket could not be decrypted");
             } else {
                 /* decode and verify the version number */
                 uint32_t version_number = PICOPARSE_32(dst->base + dst->off + decrypted - 4);
-                if (version_number != picoquic_supported_versions[quic->cnx_in_progress->version_index].version) {
+                if (version_number != picoquic_supported_versions[cnx->version_index].version) {
                     /* wrong version error */
                     ret = -1;
-                    picoquic_log_app_message(quic->cnx_in_progress, "Ticket version mismatch, expected 0x%x, got 0x%x",
-                        picoquic_supported_versions[quic->cnx_in_progress->version_index].version, version_number);
+                    picoquic_log_app_message(cnx, "Ticket version mismatch, expected 0x%x, got 0x%x",
+                        picoquic_supported_versions[cnx->version_index].version, version_number);
                 }
                 else {
                     picoquic_issued_ticket_t* server_ticket;
                     dst->off += decrypted - 4;
-                    picoquic_log_app_message(quic->cnx_in_progress, "%s",
+                    picoquic_log_app_message(cnx, "%s",
                         "Session ticket properly decrypted");
                     /* Remember resumed ticket ID in connection context */
-                    quic->cnx_in_progress->resumed_ticket_id = seq_num;
+                    cnx->resumed_ticket_id = seq_num;
                     /* Remember rtt and cwin from ticket */
                     server_ticket = picoquic_retrieve_issued_ticket(quic, seq_num);
                     if (server_ticket != NULL && server_ticket->cwin > 0) {
                         picoquic_seed_bandwidth(
-                            quic->cnx_in_progress,
+                            cnx,
                             server_ticket->rtt,
                             server_ticket->cwin,
                             server_ticket->ip_addr,
@@ -1445,55 +1635,86 @@ int picoquic_enable_custom_verify_certificate_callback(picoquic_quic_t* quic)
     return 0;
 }
 #endif
-static void picoquic_dispose_verify_certificate_callback_ctx(ptls_context_t* ctx,
-    picoquic_free_verify_certificate_ctx* free_verify_certificate_callback_fn)
-{
-    if (ctx == NULL) {
-        return;
-    }
-
-    if (ctx->verify_certificate != NULL) {
-        if (*free_verify_certificate_callback_fn != NULL) {
-            picoquic_dispose_certificate_verifier_t disposer =
-                (picoquic_dispose_certificate_verifier_t)*free_verify_certificate_callback_fn;
-            disposer(ctx->verify_certificate);
-            *free_verify_certificate_callback_fn = NULL;
-        }
-        /*
-        free(ctx->verify_certificate);
-        */
-        ctx->verify_certificate = NULL;
-    }
-
-    ctx->verify_certificate = NULL;
-}
-
 void picoquic_dispose_verify_certificate_callback(picoquic_quic_t* quic) {
     ptls_context_t* ctx = (ptls_context_t*)quic->tls_master_ctx;
     picoquic_tls_master_ref_t* ref = picoquic_tls_master_ref_from_ctx(ctx);
 
-    picoquic_dispose_verify_certificate_callback_ctx(ctx,
-        (ref == NULL) ? &quic->free_verify_certificate_callback_fn :
-        &ref->free_verify_certificate_callback_fn);
+    if (ref != NULL) {
+        picoquic_tls_verifier_ref_release(ref->verifier_ref);
+        ref->verifier_ref = NULL;
+    }
+    if (ctx != NULL) {
+        ctx->verify_certificate = NULL;
+    }
 }
 
-void picoquic_tls_set_verify_certificate_callback(picoquic_quic_t* quic,
+int picoquic_tls_verify_callback_is_owned(picoquic_quic_t* quic,
+    struct st_ptls_verify_certificate_t* cb)
+{
+    ptls_context_t* ctx = (ptls_context_t*)quic->tls_master_ctx;
+
+    return ((ctx != NULL && ctx->verify_certificate == cb) ||
+        picoquic_tls_verifier_ref_find(quic, cb) != NULL);
+}
+
+int picoquic_tls_set_verify_certificate_callback(picoquic_quic_t* quic,
     struct st_ptls_verify_certificate_t* cb, picoquic_free_verify_certificate_ctx free_fn)
 {
     ptls_context_t* ctx = (ptls_context_t*)quic->tls_master_ctx;
-    picoquic_tls_master_ref_t* ref;
+    picoquic_tls_master_ref_t* ref = picoquic_tls_master_ref_from_ctx(ctx);
+    picoquic_tls_verifier_ref_t* new_ref;
 
-    picoquic_dispose_verify_certificate_callback(quic);
-    ref = picoquic_tls_master_ref_from_ctx(ctx);
+    if (ctx == NULL || ref == NULL) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
 
+    /* A callback that is still owned anywhere within this QUIC context
+     * (currently active, or retained by an old TLS context after a
+     * certificate refresh) reuses its live ownership record; a second
+     * independent record would run the cleanup twice and free the
+     * verifier while it is referenced. Changing only the cleanup
+     * function of an owned callback is refused: ownership stays
+     * exactly as it was. */
+    if (cb != NULL || ctx->verify_certificate == NULL) {
+        picoquic_tls_verifier_ref_t* existing = picoquic_tls_verifier_ref_find(quic, cb);
+
+        if (existing != NULL) {
+            if (free_fn != existing->free_fn) {
+                return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+            }
+            if (ref->verifier_ref != existing) {
+                picoquic_tls_verifier_ref_addref(existing);
+                picoquic_tls_verifier_ref_release(ref->verifier_ref);
+                ref->verifier_ref = existing;
+                ctx->verify_certificate = cb;
+                quic->is_cert_store_not_empty = 1;
+            }
+            return 0;
+        }
+    }
+    if (cb == ctx->verify_certificate) {
+        /* Active callback with no ownership record (e.g. NULL). */
+        picoquic_free_verify_certificate_ctx current_free_fn =
+            (ref->verifier_ref != NULL) ? ref->verifier_ref->free_fn : NULL;
+        return (free_fn == current_free_fn) ? 0 : PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+
+    /* The swap is transactional: nothing is touched until the incoming
+     * verifier has a valid ownership record, so an allocation failure
+     * leaves the previous policy installed and enforced. Failing
+     * open here would silently disable certificate verification.
+     * Ownership of the incoming callback transfers only on success. */
+    new_ref = picoquic_tls_verifier_ref_create(quic, cb, free_fn);
+    if (new_ref == NULL) {
+        DBG_PRINTF("%s", "Cannot install the verify certificate callback");
+        return PICOQUIC_ERROR_MEMORY;
+    }
+
+    picoquic_tls_verifier_ref_release(ref->verifier_ref);
+    ref->verifier_ref = new_ref;
     ctx->verify_certificate = cb;
     quic->is_cert_store_not_empty = 1;
-    if (ref == NULL) {
-        quic->free_verify_certificate_callback_fn = free_fn;
-    }
-    else {
-        ref->free_verify_certificate_callback_fn = free_fn;
-    }
+    return 0;
 }
 
 /* set key from secret: this is used to create AEAD contexts and PN encoding contexts
@@ -2009,7 +2230,7 @@ static int picoquic_set_time_getter_in_ctx(picoquic_quic_t* quic, ptls_context_t
 }
 
 static void picoquic_ptls_context_free(picoquic_quic_t* quic, ptls_context_t* ctx,
-    picoquic_free_verify_certificate_ctx* free_verify_certificate_callback_fn)
+    picoquic_tls_verifier_ref_t* verifier_ref)
 {
     if (ctx != NULL) {
 
@@ -2022,22 +2243,21 @@ static void picoquic_ptls_context_free(picoquic_quic_t* quic, ptls_context_t* ct
 
         picoquic_dispose_sign_certificate(ctx);
 
-        picoquic_dispose_verify_certificate_callback_ctx(ctx, free_verify_certificate_callback_fn);
+        picoquic_tls_verifier_ref_release(verifier_ref);
+        ctx->verify_certificate = NULL;
 
         free(ctx->on_client_hello);
         free(ctx->encrypt_ticket);
         free(ctx->update_traffic_key);
         free(ctx->save_ticket);
         free((void*)ctx->cipher_suites);
-
-        picoquic_free_log_event_ctx(ctx);
     }
 }
 
 static void picoquic_tls_master_ref_free(picoquic_tls_master_ref_t* ref)
 {
     if (ref != NULL) {
-        picoquic_ptls_context_free(ref->quic, ref->ctx, &ref->free_verify_certificate_callback_fn);
+        picoquic_ptls_context_free(ref->quic, ref->ctx, ref->verifier_ref);
         free(ref->ctx);
         free(ref);
     }
@@ -2063,7 +2283,7 @@ static void picoquic_tls_master_open_count_cb(ptls_update_open_count_t* self, ss
 }
 
 static picoquic_tls_master_ref_t* picoquic_tls_master_ref_create(picoquic_quic_t* quic,
-    ptls_context_t* ctx, picoquic_free_verify_certificate_ctx free_verify_certificate_callback_fn)
+    ptls_context_t* ctx, picoquic_tls_verifier_ref_t* verifier_ref)
 {
     picoquic_tls_master_ref_t* ref = (picoquic_tls_master_ref_t*)calloc(1, sizeof(picoquic_tls_master_ref_t));
 
@@ -2071,7 +2291,7 @@ static picoquic_tls_master_ref_t* picoquic_tls_master_ref_create(picoquic_quic_t
         ref->open_count.cb = picoquic_tls_master_open_count_cb;
         ref->quic = quic;
         ref->ctx = ctx;
-        ref->free_verify_certificate_callback_fn = free_verify_certificate_callback_fn;
+        ref->verifier_ref = verifier_ref;
         ref->ref_count = 1;
         ctx->update_open_count = &ref->open_count;
     }
@@ -2085,42 +2305,66 @@ static picoquic_tls_master_ref_t* picoquic_tls_master_ref_from_ctx(ptls_context_
         NULL : (picoquic_tls_master_ref_t*)ctx->update_open_count;
 }
 
-static void picoquic_set_verify_certificate_in_ctx(picoquic_quic_t* quic,
+static int picoquic_set_verify_certificate_in_ctx(picoquic_quic_t* quic,
     ptls_context_t* ctx, ptls_context_t* old_ctx, const char* cert_root_file_name,
-    picoquic_free_verify_certificate_ctx* free_verify_certificate_callback_fn)
+    picoquic_tls_verifier_ref_t** verifier_ref)
 {
-    unsigned int is_cert_store_not_empty = 0;
-    picoquic_tls_master_ref_t* old_ref = picoquic_tls_master_ref_from_ctx(old_ctx);
+    int ret = 0;
 
-    *free_verify_certificate_callback_fn = NULL;
+    *verifier_ref = NULL;
 
-    if (old_ctx != NULL && old_ctx->verify_certificate == NULL) {
-        ctx->verify_certificate = NULL;
-    }
-    else if (old_ctx != NULL && old_ref != NULL &&
-        old_ref->free_verify_certificate_callback_fn == NULL) {
+    if (old_ctx != NULL) {
+        /* Clones (SNI identities and refreshed fallback contexts)
+         * share the master's verifier object, whatever its flavor:
+         * provider verifier (including one whose trust store was
+         * extended with in-memory roots), owned custom verifier,
+         * borrowed custom verifier, or no verifier at all. The
+         * verification policy of the QUIC context is decided once,
+         * before identities exist. */
+        picoquic_tls_master_ref_t* old_ref = picoquic_tls_master_ref_from_ctx(old_ctx);
+
         ctx->verify_certificate = old_ctx->verify_certificate;
-        is_cert_store_not_empty = (ctx->verify_certificate != NULL);
+        if (old_ref != NULL && old_ref->verifier_ref != NULL) {
+            picoquic_tls_verifier_ref_addref(old_ref->verifier_ref);
+            *verifier_ref = old_ref->verifier_ref;
+        }
     }
     else {
-        ctx->verify_certificate = picoquic_get_certificate_verifier(cert_root_file_name,
-            &is_cert_store_not_empty, free_verify_certificate_callback_fn);
+        unsigned int is_cert_store_not_empty = 0;
+        picoquic_free_verify_certificate_ctx free_fn = NULL;
+        struct st_ptls_verify_certificate_t* verifier =
+            picoquic_get_certificate_verifier(cert_root_file_name,
+                &is_cert_store_not_empty, &free_fn);
+
+        if (verifier != NULL) {
+            *verifier_ref = picoquic_tls_verifier_ref_create(quic, verifier, free_fn);
+            if (*verifier_ref == NULL) {
+                if (free_fn != NULL) {
+                    free_fn(verifier);
+                }
+                verifier = NULL;
+                is_cert_store_not_empty = 0;
+                ret = PICOQUIC_ERROR_MEMORY;
+            }
+        }
+        ctx->verify_certificate = verifier;
+        quic->is_cert_store_not_empty = is_cert_store_not_empty;
     }
 
-    quic->is_cert_store_not_empty = is_cert_store_not_empty;
+    return ret;
 }
 
 static int picoquic_create_ptls_context(picoquic_quic_t* quic,
     ptls_context_t* old_ctx, char const* cert_file_name, char const* key_file_name,
     const char* cert_root_file_name, const uint8_t* ticket_key, size_t ticket_key_length,
     int setup_ticket_aead, ptls_context_t** ctx_out,
-    picoquic_free_verify_certificate_ctx* free_verify_certificate_callback_fn)
+    picoquic_tls_verifier_ref_t** verifier_ref)
 {
     int ret = 0;
     ptls_context_t* ctx = NULL;
 
     *ctx_out = NULL;
-    *free_verify_certificate_callback_fn = NULL;
+    *verifier_ref = NULL;
     picoquic_tls_api_init();
 
     ctx = (ptls_context_t*)malloc(sizeof(ptls_context_t));
@@ -2151,7 +2395,22 @@ static int picoquic_create_ptls_context(picoquic_quic_t* quic,
             ret = picoquic_set_time_getter_in_ctx(quic, ctx);
         }
 
+        /* Every TLS context of this QUIC context (master, identity
+         * clones, refreshed fallback contexts) shares the QUIC-owned
+         * key log sink, so configuring or changing the key log file
+         * applies everywhere, at any time, and the FILE is closed
+         * exactly once. */
         if (ret == 0) {
+            ctx->log_event = (quic->keylog_sink != NULL) ?
+                &quic->keylog_sink->super : NULL;
+        }
+
+        /* Install picoquic's traffic-key callback on a new master
+         * context, and on a clone only when the source context had it:
+         * a context that deliberately disabled it (update_traffic_key
+         * == NULL, e.g. QMux) must keep it disabled in its clones. When
+         * present, each clone gets its own callback object. */
+        if (ret == 0 && (old_ctx == NULL || old_ctx->update_traffic_key != NULL)) {
             ctx->update_traffic_key = picoquic_set_update_traffic_key_callback();
             if (ctx->update_traffic_key == NULL) {
                 ret = PICOQUIC_ERROR_MEMORY;
@@ -2206,8 +2465,8 @@ static int picoquic_create_ptls_context(picoquic_quic_t* quic,
         }
 
         if (ret == 0) {
-            picoquic_set_verify_certificate_in_ctx(quic, ctx, old_ctx,
-                cert_root_file_name, free_verify_certificate_callback_fn);
+            ret = picoquic_set_verify_certificate_in_ctx(quic, ctx, old_ctx,
+                cert_root_file_name, verifier_ref);
         }
 
         if (ret == 0 && (quic->ticket_file_name != NULL ||
@@ -2230,7 +2489,8 @@ static int picoquic_create_ptls_context(picoquic_quic_t* quic,
             *ctx_out = ctx;
         }
         else {
-            picoquic_ptls_context_free(quic, ctx, free_verify_certificate_callback_fn);
+            picoquic_ptls_context_free(quic, ctx, *verifier_ref);
+            *verifier_ref = NULL;
             free(ctx);
         }
     }
@@ -2243,22 +2503,33 @@ int picoquic_master_tlscontext(picoquic_quic_t* quic,
     const uint8_t* ticket_key, size_t ticket_key_length)
 {
     ptls_context_t* ctx = NULL;
-    picoquic_free_verify_certificate_ctx free_verify_certificate_callback_fn = NULL;
-    int ret = picoquic_create_ptls_context(quic, NULL, cert_file_name, key_file_name,
+    picoquic_tls_verifier_ref_t* verifier_ref = NULL;
+    int ret = 0;
+
+    if (quic->keylog_sink == NULL) {
+        quic->keylog_sink = (struct st_picoquic_log_event_t*)malloc(
+            sizeof(struct st_picoquic_log_event_t));
+        if (quic->keylog_sink == NULL) {
+            return PICOQUIC_ERROR_MEMORY;
+        }
+        quic->keylog_sink->super.cb = picoquic_log_event_call_back;
+        quic->keylog_sink->fp = NULL;
+    }
+
+    ret = picoquic_create_ptls_context(quic, NULL, cert_file_name, key_file_name,
         cert_root_file_name, ticket_key, ticket_key_length, 1, &ctx,
-        &free_verify_certificate_callback_fn);
+        &verifier_ref);
 
     if (ret == 0) {
         picoquic_tls_master_ref_t* ref = picoquic_tls_master_ref_create(quic, ctx,
-            free_verify_certificate_callback_fn);
+            verifier_ref);
         if (ref == NULL) {
-            picoquic_ptls_context_free(quic, ctx, &free_verify_certificate_callback_fn);
+            picoquic_ptls_context_free(quic, ctx, verifier_ref);
             free(ctx);
             ret = PICOQUIC_ERROR_MEMORY;
         }
         else {
             quic->tls_master_ctx = ctx;
-            quic->free_verify_certificate_callback_fn = NULL;
             picoquic_public_random_seed(quic);
         }
     }
@@ -2273,7 +2544,7 @@ int picoquic_refresh_tls_certificate(picoquic_quic_t* quic,
     ptls_context_t* old_ctx;
     ptls_context_t* new_ctx = NULL;
     picoquic_tls_master_ref_t* old_ref;
-    picoquic_free_verify_certificate_ctx free_verify_certificate_callback_fn = NULL;
+    picoquic_tls_verifier_ref_t* verifier_ref = NULL;
 
     if (quic == NULL || cert_file_name == NULL || key_file_name == NULL) {
         return PICOQUIC_ERROR_UNEXPECTED_ERROR;
@@ -2285,26 +2556,25 @@ int picoquic_refresh_tls_certificate(picoquic_quic_t* quic,
     old_ref = picoquic_tls_master_ref_from_ctx(old_ctx);
     ret = picoquic_create_ptls_context(quic, old_ctx, cert_file_name, key_file_name,
         quic->tls_cert_root_file_name, NULL, 0, 0, &new_ctx,
-        &free_verify_certificate_callback_fn);
+        &verifier_ref);
     if (ret != 0) {
         return ret;
     }
 
-    if (picoquic_tls_master_ref_create(quic, new_ctx, free_verify_certificate_callback_fn) == NULL) {
-        picoquic_ptls_context_free(quic, new_ctx, &free_verify_certificate_callback_fn);
+    if (picoquic_tls_master_ref_create(quic, new_ctx, verifier_ref) == NULL) {
+        picoquic_ptls_context_free(quic, new_ctx, verifier_ref);
         free(new_ctx);
         return PICOQUIC_ERROR_MEMORY;
     }
 
     quic->tls_master_ctx = new_ctx;
-    quic->free_verify_certificate_callback_fn = NULL;
     quic->enforce_client_only = 0;
 
     if (old_ref != NULL) {
         picoquic_tls_master_ref_release(old_ref);
     }
     else if (old_ctx != NULL) {
-        picoquic_ptls_context_free(quic, old_ctx, &quic->free_verify_certificate_callback_fn);
+        picoquic_ptls_context_free(quic, old_ctx, NULL);
         free(old_ctx);
     }
 
@@ -2321,8 +2591,17 @@ void picoquic_master_tlscontext_free(picoquic_quic_t* quic)
         picoquic_tls_master_ref_release(ref);
     }
     else if (ctx != NULL) {
-        picoquic_ptls_context_free(quic, ctx, &quic->free_verify_certificate_callback_fn);
+        picoquic_ptls_context_free(quic, ctx, NULL);
         free(ctx);
+    }
+
+    /* All contexts are gone by now; close the shared key log once. */
+    if (quic->keylog_sink != NULL) {
+        if (quic->keylog_sink->fp != NULL) {
+            (void)picoquic_file_close(quic->keylog_sink->fp);
+        }
+        free(quic->keylog_sink);
+        quic->keylog_sink = NULL;
     }
 }
 
@@ -2433,52 +2712,27 @@ static void picoquic_log_event_call_back(ptls_log_event_t *_self, ptls_t *tls, c
 }
 
 /**
- * Free the log-event call back, either when the TLS master context is freed,
- * or when the key log file is reset.
- */
-static void picoquic_free_log_event_ctx(ptls_context_t* ctx)
-{
-    if (ctx != NULL && ctx->log_event != NULL) {
-        struct st_picoquic_log_event_t* picoquic_log_event = (struct st_picoquic_log_event_t*)ctx->log_event;
-        if (picoquic_log_event != NULL && picoquic_log_event->fp != NULL) {
-            picoquic_file_close(picoquic_log_event->fp);
-        }
-        free(ctx->log_event);
-        ctx->log_event = NULL;
-    }
-}
-
-
-/**
  * Sets the output file handle for writing traffic secrets in a format that can
- * be recognized by Wireshark.
+ * be recognized by Wireshark. The sink is owned by the QUIC context and shared
+ * by all its TLS contexts, so the change applies to the fallback context,
+ * every SNI identity (existing or future), refreshed fallback contexts, and
+ * contexts retained by live connections alike.
  */
 void picoquic_set_key_log_file(picoquic_quic_t *quic, char const * keylog_filename)
 {
+    struct st_picoquic_log_event_t* sink = quic->keylog_sink;
+
     PICOQUIC_THREAD_CHECK(quic);
-    ptls_context_t* ctx = (ptls_context_t*)quic->tls_master_ctx;
-    struct st_picoquic_log_event_t* log_event = (struct st_picoquic_log_event_t*)ctx->log_event;
 
-    if (log_event == NULL) {
-        log_event = (struct st_picoquic_log_event_t*)malloc(sizeof(struct st_picoquic_log_event_t));
-        if (log_event != NULL) {
-            log_event->super.cb = picoquic_log_event_call_back;
+    if (sink != NULL) {
+        if (sink->fp != NULL) {
+            (void)picoquic_file_close(sink->fp);
+            sink->fp = NULL;
+        }
+        if (keylog_filename != NULL) {
+            sink->fp = picoquic_file_open(keylog_filename, "a");
         }
     }
-    else {
-        if (log_event->fp != NULL) {
-            picoquic_file_close(log_event->fp);
-            log_event->fp = NULL;
-        }
-    }
-
-    if (log_event != NULL) {
-        log_event->fp = picoquic_file_open(keylog_filename, "a");
-        log_event->super.cb = picoquic_log_event_call_back;
-        ctx->log_event = (ptls_log_event_t*)log_event;
-    }
-
-    ctx->log_event = (ptls_log_event_t*)log_event;
 }
 
 /*
@@ -3258,6 +3512,9 @@ int picoquic_create_cnxid_reset_secret(picoquic_quic_t* quic, picoquic_connectio
 void picoquic_set_tls_certificate_chain(picoquic_quic_t* quic, ptls_iovec_t* certs, size_t count)
 {
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_tls_certificate_chain")) {
+        return;
+    }
     ptls_context_t* ctx = (ptls_context_t*)quic->tls_master_ctx;
 
     free_certificates_list(ctx->certificates.list, ctx->certificates.count);
@@ -3677,4 +3934,596 @@ int picoquic_verify_retry_protection(void * integrity_aead, uint8_t * bytes, siz
     }
 
     return ret;
+}
+
+/* Server-side SNI virtual hosts: see picoquic.h for the API contract.
+ *
+ * A server identity owns a ptls_context_t cloned from the master
+ * context at creation time, with its own certificate chain and signing
+ * key. The contexts are reference counted through the same
+ * picoquic_tls_master_ref_t machinery that protects the master context
+ * across picoquic_refresh_tls_certificate(): the identity holds one
+ * reference, each registry entry holds one reference, and picotls'
+ * update_open_count callback accounts for the connections, so a context
+ * stays alive for as long as any connection uses it, no matter when the
+ * identity is released or replaced. */
+
+struct st_picoquic_server_identity_t {
+    struct st_picoquic_server_identity_t* next;
+    picoquic_quic_t* quic;
+    ptls_context_t* ctx;
+};
+
+typedef struct st_picoquic_sni_registry_entry_t {
+    struct st_picoquic_sni_registry_entry_t* next;
+    ptls_context_t* ctx;
+    void* server_name_ctx;
+    picoquic_server_resumption_scope_t resumption_scope;
+    char* pattern; /* canonical lowercase; for wildcards, the suffix after "*." */
+    size_t pattern_length;
+    unsigned int is_wildcard : 1;
+} picoquic_sni_registry_entry_t;
+
+static void picoquic_tls_ctx_addref(ptls_context_t* ctx)
+{
+    picoquic_tls_master_ref_t* ref = picoquic_tls_master_ref_from_ctx(ctx);
+    if (ref != NULL) {
+        ref->ref_count++;
+    }
+}
+
+static void picoquic_tls_ctx_release(ptls_context_t* ctx)
+{
+    picoquic_tls_master_ref_release(picoquic_tls_master_ref_from_ctx(ctx));
+}
+
+static int picoquic_sni_validate_name(const uint8_t* name, size_t name_length)
+{
+    size_t label_start = 0;
+    int label_is_numeric = 1;
+
+    if (name == NULL || name_length == 0 || name_length > 253) {
+        return -1;
+    }
+
+    /* Every label must be 1..63 letters, digits or hyphens, with no
+     * hyphen in first or last position. This also excludes a leading
+     * or trailing dot, empty labels, whitespace, control characters,
+     * embedded NUL and non-ASCII (IDNs must be given as A-labels).
+     * The final label must not be all digits: that shape is an IP
+     * literal (or indistinguishable from one), and literal addresses
+     * are not valid SNI host names (RFC 6066). IPv6 literals are
+     * already excluded by the character rules. */
+    for (size_t i = 0; i <= name_length; i++) {
+        if (i == name_length || name[i] == '.') {
+            size_t label_length = i - label_start;
+            if (label_length == 0 || label_length > 63 ||
+                name[label_start] == '-' || name[i - 1] == '-' ||
+                (i == name_length && label_is_numeric)) {
+                return -1;
+            }
+            label_start = i + 1;
+            label_is_numeric = 1;
+        }
+        else {
+            uint8_t c = name[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '-')) {
+                return -1;
+            }
+            if (!(c >= '0' && c <= '9')) {
+                label_is_numeric = 0;
+            }
+        }
+    }
+
+    return 0;
+}
+
+int picoquic_tls_config_is_frozen(picoquic_quic_t* quic, char const* setter_name)
+{
+    int is_frozen = (quic != NULL && quic->tls_config_frozen);
+
+    if (is_frozen) {
+        DBG_PRINTF("%s refused: TLS configuration is frozen once server identities exist", setter_name);
+    }
+
+    return is_frozen;
+}
+
+static int picoquic_server_resumption_scope_is_zero(const picoquic_server_resumption_scope_t* scope)
+{
+    int is_zero = 1;
+
+    for (size_t i = 0; is_zero && i < sizeof(scope->id); i++) {
+        is_zero = (scope->id[i] == 0);
+    }
+
+    return is_zero;
+}
+
+void picoquic_server_resumption_scope_random(picoquic_quic_t* quic,
+    picoquic_server_resumption_scope_t* scope)
+{
+    /* The all-zero value is the "no stable scope" sentinel and is never
+     * produced as a random scope. */
+    do {
+        picoquic_crypto_random(quic, scope->id, sizeof(scope->id));
+    } while (picoquic_server_resumption_scope_is_zero(scope));
+}
+
+/* Enable SNI resumption scoping: from now on session tickets are bound
+ * to the resumption scope selected for the connection. Sticky for the
+ * lifetime of the QUIC context, so tickets issued under a scope can
+ * never become valid again under legacy unscoped processing. */
+static void picoquic_sni_resumption_scoping_enable(picoquic_quic_t* quic)
+{
+    if (!quic->sni_resumption_scoping) {
+        picoquic_server_resumption_scope_random(quic, &quic->default_resumption_scope);
+        quic->sni_resumption_scoping = 1;
+    }
+}
+
+int picoquic_server_identity_create(picoquic_quic_t* quic,
+    char const* cert_file_name, char const* key_file_name,
+    picoquic_server_identity_t** identity)
+{
+    int ret = 0;
+    ptls_context_t* ctx = NULL;
+    picoquic_tls_verifier_ref_t* verifier_ref = NULL;
+    picoquic_server_identity_t* created = NULL;
+
+    if (identity == NULL) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+    *identity = NULL;
+    if (quic == NULL || quic->tls_master_ctx == NULL ||
+        cert_file_name == NULL || key_file_name == NULL) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+
+    PICOQUIC_THREAD_CHECK(quic);
+
+    /* Creating the first identity freezes the TLS configuration. A
+     * context with no root store and no custom verifier normally adopts
+     * the null verifier lazily, when its first client connection is
+     * created; that lazy setup is blocked once the configuration is
+     * frozen. Finalize it here, before the freeze and before the master
+     * context is cloned, so a client connection later opened from this
+     * same context still accepts its peer instead of being rejected by
+     * the empty-store verifier. (A server on such a context that also
+     * requests client authentication then accepts unverified client
+     * certificates, exactly as a no-root-store context already does.) */
+    if (!quic->tls_config_frozen && !quic->is_cert_store_not_empty) {
+        picoquic_dispose_verify_certificate_callback(quic);
+    }
+
+    ret = picoquic_create_ptls_context(quic, (ptls_context_t*)quic->tls_master_ctx,
+        cert_file_name, key_file_name, quic->tls_cert_root_file_name, NULL, 0, 0,
+        &ctx, &verifier_ref);
+
+    if (ret == 0) {
+        created = (picoquic_server_identity_t*)calloc(1, sizeof(picoquic_server_identity_t));
+        if (created == NULL ||
+            picoquic_tls_master_ref_create(quic, ctx, verifier_ref) == NULL) {
+            if (created != NULL) {
+                free(created);
+                created = NULL;
+            }
+            picoquic_ptls_context_free(quic, ctx, verifier_ref);
+            free(ctx);
+            ret = PICOQUIC_ERROR_MEMORY;
+        }
+        else {
+            created->quic = quic;
+            created->ctx = ctx;
+            created->next = quic->server_identity_first;
+            quic->server_identity_first = created;
+            quic->tls_config_frozen = 1;
+            *identity = created;
+        }
+    }
+
+    return ret;
+}
+
+void picoquic_server_identity_release(picoquic_server_identity_t* identity)
+{
+    if (identity != NULL) {
+        picoquic_server_identity_t** pnext = &identity->quic->server_identity_first;
+
+        PICOQUIC_THREAD_CHECK(identity->quic);
+
+        while (*pnext != NULL) {
+            if (*pnext == identity) {
+                *pnext = identity->next;
+                break;
+            }
+            pnext = &(*pnext)->next;
+        }
+        picoquic_tls_ctx_release(identity->ctx);
+        free(identity);
+    }
+}
+
+void picoquic_set_server_identity_select_fn(picoquic_quic_t* quic,
+    picoquic_server_identity_select_fn select_fn, void* select_ctx)
+{
+    PICOQUIC_THREAD_CHECK(quic);
+    if (select_fn != NULL) {
+        picoquic_sni_resumption_scoping_enable(quic);
+    }
+    quic->server_identity_select_fn = select_fn;
+    quic->server_identity_select_ctx = select_ctx;
+}
+
+/* Canonicalize and check a registration pattern. On success, *suffix
+ * points to the part to store (past the "*." for wildcards) and
+ * *is_wildcard is set. */
+static int picoquic_sni_pattern_check(char const* name_pattern, int* is_wildcard,
+    char const** suffix)
+{
+    int ret = 0;
+    size_t length = (name_pattern == NULL) ? 0 : strlen(name_pattern);
+
+    *is_wildcard = 0;
+    *suffix = name_pattern;
+
+    if (name_pattern == NULL) {
+        ret = -1;
+    }
+    else if (name_pattern[0] == '*') {
+        /* Only a complete leftmost label may be a wildcard; what
+         * follows "*." must be a well-formed host name. The validation
+         * also excludes any further '*'. */
+        if (length < 3 || name_pattern[1] != '.' ||
+            picoquic_sni_validate_name((const uint8_t*)name_pattern + 2, length - 2) != 0) {
+            ret = -1;
+        }
+        else {
+            *is_wildcard = 1;
+            *suffix = name_pattern + 2;
+        }
+    }
+    else if (picoquic_sni_validate_name((const uint8_t*)name_pattern, length) != 0) {
+        ret = -1;
+    }
+
+    return ret;
+}
+
+static char* picoquic_sni_pattern_dup_lower(char const* pattern)
+{
+    size_t length = strlen(pattern);
+    char* copy = (char*)malloc(length + 1);
+
+    if (copy != NULL) {
+        for (size_t i = 0; i < length; i++) {
+            char c = pattern[i];
+            copy[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+        }
+        copy[length] = 0;
+    }
+
+    return copy;
+}
+
+/* Compare a canonical (lowercase) pattern to a length-delimited name,
+ * ASCII case insensitively. */
+static int picoquic_sni_name_matches(char const* pattern, size_t pattern_length,
+    const uint8_t* name, size_t name_length)
+{
+    int matches = (pattern_length == name_length);
+
+    for (size_t i = 0; matches && i < name_length; i++) {
+        uint8_t c = name[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (uint8_t)(c + ('a' - 'A'));
+        }
+        matches = ((uint8_t)pattern[i] == c);
+    }
+
+    return matches;
+}
+
+static picoquic_sni_registry_entry_t* picoquic_sni_registry_find(picoquic_quic_t* quic,
+    char const* canonical_pattern, int is_wildcard)
+{
+    picoquic_sni_registry_entry_t* entry = quic->sni_registry_first;
+
+    while (entry != NULL) {
+        if ((int)entry->is_wildcard == is_wildcard &&
+            strcmp(entry->pattern, canonical_pattern) == 0) {
+            break;
+        }
+        entry = entry->next;
+    }
+
+    return entry;
+}
+
+int picoquic_set_server_identity_ex(picoquic_quic_t* quic, char const* name_pattern,
+    picoquic_server_identity_t* identity, void* server_name_ctx,
+    const picoquic_server_resumption_scope_t* scope)
+{
+    int ret = 0;
+    int is_wildcard = 0;
+    char const* suffix = NULL;
+    char* canonical = NULL;
+
+    if (quic == NULL || identity == NULL || identity->quic != quic) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+    if (picoquic_sni_pattern_check(name_pattern, &is_wildcard, &suffix) != 0) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+    /* The all-zero scope is the "no stable scope" sentinel; registering
+     * it explicitly would let a zero-initialized configuration value
+     * silently keep tickets valid across a reassignment. */
+    if (scope != NULL && picoquic_server_resumption_scope_is_zero(scope)) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+
+    PICOQUIC_THREAD_CHECK(quic);
+
+    canonical = picoquic_sni_pattern_dup_lower(suffix);
+    if (canonical == NULL) {
+        ret = PICOQUIC_ERROR_MEMORY;
+    }
+    else {
+        picoquic_sni_registry_entry_t* entry =
+            picoquic_sni_registry_find(quic, canonical, is_wildcard);
+
+        if (entry != NULL) {
+            /* Replace: new handshakes use the new identity; connections
+             * that selected the old context keep it alive through their
+             * own references. Without an explicit scope the entry gets
+             * a fresh one, invalidating previously issued tickets. */
+            picoquic_tls_ctx_addref(identity->ctx);
+            picoquic_tls_ctx_release(entry->ctx);
+            entry->ctx = identity->ctx;
+            entry->server_name_ctx = server_name_ctx;
+            free(canonical);
+        }
+        else {
+            entry = (picoquic_sni_registry_entry_t*)calloc(1, sizeof(picoquic_sni_registry_entry_t));
+            if (entry == NULL) {
+                free(canonical);
+                ret = PICOQUIC_ERROR_MEMORY;
+            }
+            else {
+                entry->ctx = identity->ctx;
+                entry->server_name_ctx = server_name_ctx;
+                entry->pattern = canonical;
+                entry->pattern_length = strlen(canonical);
+                entry->is_wildcard = (unsigned int)is_wildcard;
+                picoquic_tls_ctx_addref(identity->ctx);
+                entry->next = quic->sni_registry_first;
+                quic->sni_registry_first = entry;
+            }
+        }
+        if (ret == 0) {
+            if (scope != NULL) {
+                entry->resumption_scope = *scope;
+            }
+            else {
+                picoquic_server_resumption_scope_random(quic, &entry->resumption_scope);
+            }
+            picoquic_sni_resumption_scoping_enable(quic);
+        }
+    }
+
+    return ret;
+}
+
+int picoquic_set_server_identity(picoquic_quic_t* quic, char const* name_pattern,
+    picoquic_server_identity_t* identity, void* server_name_ctx)
+{
+    return picoquic_set_server_identity_ex(quic, name_pattern, identity,
+        server_name_ctx, NULL);
+}
+
+static void picoquic_sni_registry_entry_free(picoquic_sni_registry_entry_t* entry)
+{
+    picoquic_tls_ctx_release(entry->ctx);
+    free(entry->pattern);
+    free(entry);
+}
+
+int picoquic_remove_server_identity(picoquic_quic_t* quic, char const* name_pattern)
+{
+    int ret = 0;
+    int is_wildcard = 0;
+    char const* suffix = NULL;
+    char* canonical = NULL;
+
+    if (quic == NULL ||
+        picoquic_sni_pattern_check(name_pattern, &is_wildcard, &suffix) != 0) {
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+
+    PICOQUIC_THREAD_CHECK(quic);
+
+    canonical = picoquic_sni_pattern_dup_lower(suffix);
+    if (canonical == NULL) {
+        ret = PICOQUIC_ERROR_MEMORY;
+    }
+    else {
+        picoquic_sni_registry_entry_t** pnext = &quic->sni_registry_first;
+
+        ret = PICOQUIC_ERROR_UNEXPECTED_ERROR;
+        while (*pnext != NULL) {
+            picoquic_sni_registry_entry_t* entry = *pnext;
+            if ((int)entry->is_wildcard == is_wildcard &&
+                strcmp(entry->pattern, canonical) == 0) {
+                *pnext = entry->next;
+                picoquic_sni_registry_entry_free(entry);
+                ret = 0;
+                break;
+            }
+            pnext = &entry->next;
+        }
+        free(canonical);
+    }
+
+    return ret;
+}
+
+/* Match a validated ClientHello server name against the registry:
+ * exact entries take precedence over wildcard entries; a wildcard
+ * covers exactly one leftmost label. */
+static picoquic_sni_registry_entry_t* picoquic_sni_registry_match(picoquic_quic_t* quic,
+    const uint8_t* name, size_t name_length)
+{
+    picoquic_sni_registry_entry_t* entry = quic->sni_registry_first;
+    picoquic_sni_registry_entry_t* wildcard_match = NULL;
+    const uint8_t* label_end = (const uint8_t*)memchr(name, '.', name_length);
+
+    while (entry != NULL) {
+        if (!entry->is_wildcard) {
+            if (picoquic_sni_name_matches(entry->pattern, entry->pattern_length,
+                name, name_length)) {
+                return entry;
+            }
+        }
+        else if (wildcard_match == NULL && label_end != NULL && label_end != name) {
+            size_t suffix_offset = (size_t)(label_end - name) + 1;
+            if (suffix_offset < name_length &&
+                picoquic_sni_name_matches(entry->pattern, entry->pattern_length,
+                    name + suffix_offset, name_length - suffix_offset)) {
+                wildcard_match = entry;
+            }
+        }
+        entry = entry->next;
+    }
+
+    return wildcard_match;
+}
+
+/* Resolve the server identity for a ClientHello. Returns 0 and sets
+ * *selected_ctx (NULL meaning the default context) on success, or a TLS
+ * alert code. When SNI resumption scoping is enabled,
+ * *resumption_scope receives the scope for the connection: the
+ * matching registry entry's scope, the scope supplied by the selector
+ * for "selected" (or a fresh connection-local scope when the selector
+ * supplies none, so that resumption is effectively disabled), and the
+ * default scope otherwise. */
+static int picoquic_server_identity_resolve(picoquic_quic_t* quic, picoquic_cnx_t* cnx,
+    ptls_on_client_hello_parameters_t* params, int sni_present,
+    ptls_context_t** selected_ctx, void** server_name_ctx,
+    picoquic_server_resumption_scope_t* resumption_scope, char const** selection_source)
+{
+    int consult_registry = 1;
+    int selector_ran = 0;
+    int identity_selected = 0;
+    int registry_matched = 0;
+    picoquic_server_resumption_scope_t selector_scope;
+
+    memset(&selector_scope, 0, sizeof(selector_scope));
+
+    *selected_ctx = NULL;
+    *server_name_ctx = NULL;
+    *selection_source = "default";
+    if (quic->sni_resumption_scoping) {
+        *resumption_scope = quic->default_resumption_scope;
+    }
+
+    if (quic->server_identity_select_fn != NULL && cnx != NULL) {
+        picoquic_client_hello_info_t hello;
+        picoquic_server_identity_t* selected_identity = NULL;
+
+        selector_ran = 1;
+
+        memset(&hello, 0, sizeof(hello));
+        if (sni_present) {
+            hello.server_name = params->server_name.base;
+            hello.server_name_length = params->server_name.len;
+        }
+        hello.alpn_list = (const picoquic_iovec_t*)params->negotiated_protocols.list;
+        hello.alpn_count = params->negotiated_protocols.count;
+        hello.signature_algorithms = params->signature_algorithms.list;
+        hello.signature_algorithms_count = params->signature_algorithms.count;
+        hello.certificate_compression_algorithms = params->certificate_compression_algorithms.list;
+        hello.certificate_compression_algorithms_count = params->certificate_compression_algorithms.count;
+        hello.server_certificate_types = params->server_certificate_types.list;
+        hello.server_certificate_types_count = params->server_certificate_types.count;
+
+        switch (quic->server_identity_select_fn(cnx, &hello, &selected_identity,
+            server_name_ctx, &selector_scope, quic->server_identity_select_ctx)) {
+        case picoquic_server_identity_result_selected:
+            if (selected_identity == NULL || selected_identity->quic != quic) {
+                picoquic_log_app_message(cnx, "%s",
+                    "Identity selector returned an invalid identity");
+                return PTLS_ALERT_INTERNAL_ERROR;
+            }
+            *selected_ctx = selected_identity->ctx;
+            *selection_source = "selector";
+            consult_registry = 0;
+            identity_selected = 1;
+            break;
+        case picoquic_server_identity_result_use_default:
+            consult_registry = 0;
+            break;
+        case picoquic_server_identity_result_fallthrough:
+            break;
+        case picoquic_server_identity_result_reject:
+            picoquic_log_app_message(cnx, "%s", "Identity selector rejected the server name");
+            return PTLS_ALERT_UNRECOGNIZED_NAME;
+        default:
+            picoquic_log_app_message(cnx, "%s", "Identity selector returned an invalid result");
+            return PTLS_ALERT_INTERNAL_ERROR;
+        }
+    }
+
+    if (*selected_ctx == NULL && consult_registry && sni_present) {
+        picoquic_sni_registry_entry_t* entry = picoquic_sni_registry_match(quic,
+            params->server_name.base, params->server_name.len);
+        if (entry != NULL) {
+            *selected_ctx = entry->ctx;
+            *server_name_ctx = entry->server_name_ctx;
+            *resumption_scope = entry->resumption_scope;
+            *selection_source = (entry->is_wildcard) ? "registry wildcard" : "registry exact";
+            registry_matched = 1;
+        }
+    }
+
+    /* The selector's scope applies to every result the selector fully
+     * decides: selected, use_default, and fallthrough with no
+     * registry match. Without a stable scope from the selector, a
+     * selection that carries a routing context is bound to a fresh
+     * connection-local scope, so a ticket issued under one routing can
+     * never resume after the routing changes; a selection with no
+     * routing context keeps the shared default scope and its normal
+     * fallback resumption. A registry match overrides both the routing
+     * context and the scope. */
+    if (quic->sni_resumption_scoping && selector_ran && !registry_matched) {
+        if (!picoquic_server_resumption_scope_is_zero(&selector_scope)) {
+            *resumption_scope = selector_scope;
+        }
+        else if (identity_selected || *server_name_ctx != NULL) {
+            picoquic_server_resumption_scope_random(quic, resumption_scope);
+        }
+    }
+
+    return 0;
+}
+
+void* picoquic_get_server_name_context(picoquic_cnx_t* cnx)
+{
+    return (cnx == NULL) ? NULL : cnx->server_name_ctx;
+}
+
+/* Called from picoquic_free(): release the registry and any identities
+ * the application did not release. Runs after all connections have been
+ * deleted, so the last reference to each context is dropped here. */
+void picoquic_free_server_identities(picoquic_quic_t* quic)
+{
+    while (quic->sni_registry_first != NULL) {
+        picoquic_sni_registry_entry_t* entry = quic->sni_registry_first;
+        quic->sni_registry_first = entry->next;
+        picoquic_sni_registry_entry_free(entry);
+    }
+    while (quic->server_identity_first != NULL) {
+        picoquic_server_identity_release(quic->server_identity_first);
+    }
 }

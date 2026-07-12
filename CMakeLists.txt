@@ -9,6 +9,7 @@ else()
     option(BUILD_PICO_SIM "Build pico_sim" ON)
 endif()
 
+
 project(picoquic
         VERSION 1.1.50.3
         DESCRIPTION "picoquic library"
@@ -235,6 +236,7 @@ set(PICOQUIC_TEST_LIBRARY_FILES
     picoquictest/sacktest.c
     picoquictest/satellite_test.c
     picoquictest/skip_frame_test.c
+    picoquictest/sni_test.c
     picoquictest/socket_test.c
     picoquictest/sockloop_test.c
     picoquictest/spinbit_test.c
@@ -485,6 +487,7 @@ add_library(picoquic::picoquic-core ALIAS picoquic-core)
 message(STATUS "Defining picoquic-core")
 message(STATUS "mbedtls/include: ${MBEDTLS_INCLUDE_DIRS}")
 
+
 target_include_directories(picoquic-core
     PRIVATE
         ${PTLS_INCLUDE_DIRS}
@@ -625,6 +628,7 @@ if(BUILD_TESTING AND picoquic_BUILD_TESTS)
 
     add_library(picoquic-test STATIC ${PICOQUIC_TEST_LIBRARY_FILES})
     target_link_libraries(picoquic-test PUBLIC picoquic-core picoquic-log picohttp-core)
+
     target_include_directories(picoquic-test
         PRIVATE
             ${MBEDTLS_INCLUDE_DIRS}

@@ -350,8 +350,11 @@ int picoquic_ech_configure_quic_ctx(picoquic_quic_t * quic, char const* private_
     int ret = 0;
     ptls_context_t* ctx = (ptls_context_t*)quic->tls_master_ctx;
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_ech_configure_quic_ctx")) {
+        return PICOQUIC_ERROR_TLS_CONFIG_FROZEN;
+    }
 
-    picoquic_release_quic_ech_ctx(quic);
+    picoquic_release_quic_ech_ctx_internal(quic);
     ctx->ech.client.ciphers = picoquic_hpke_cipher_suites;
     ctx->ech.client.kems = picoquic_hpke_kems;
     if (private_key_file != NULL) {
@@ -368,24 +371,43 @@ int picoquic_ech_configure_quic_ctx(picoquic_quic_t * quic, char const* private_
 /* The call to ech_release_quic_ctx releases the allocations done by the
 * call to ech_configure_quic_ctx. It should be used when deleting the quic context.
 * It can be safely used even if there was no call to ech_configure_quic_ctx.
-* 
+*
 * This is performed automatically when deleting a quic context in "picoquic_free"
  */
 
-void picoquic_release_quic_ech_ctx(picoquic_quic_t* quic)
+/* Unconditional cleanup. The create_opener pointer is cleared as well as
+ * the retry configuration, so that server identity contexts, which
+ * shallow-copy the master context, are never left pointing at a freed
+ * opener. Used directly by picoquic_free and by the ECH configuration
+ * path; the public entry below is the guarded version. */
+void picoquic_release_quic_ech_ctx_internal(picoquic_quic_t* quic)
 {
     ptls_context_t* ctx = (ptls_context_t*)quic->tls_master_ctx;
-    PICOQUIC_THREAD_CHECK(quic);
 
     if (ctx != NULL) {
         ech_opener_callback_t* ech_cb = (ech_opener_callback_t*)ctx->ech.server.create_opener;
         ctx->ech.server.retry_configs.base = NULL;
         ctx->ech.server.retry_configs.len = 0;
+        ctx->ech.server.create_opener = NULL;
 
         if (ech_cb != NULL) {
             ech_dispose_opener_callback(ech_cb);
         }
     }
+}
+
+void picoquic_release_quic_ech_ctx(picoquic_quic_t* quic)
+{
+    PICOQUIC_THREAD_CHECK(quic);
+
+    /* Once server identities have frozen the TLS configuration, the ECH
+     * opener is shared with identity contexts and must not be freed out
+     * from under them; the release is ignored (the opener is cleaned up
+     * with the QUIC context). */
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_release_quic_ech_ctx")) {
+        return;
+    }
+    picoquic_release_quic_ech_ctx_internal(quic);
 }
 
 /* Configure a tls connection context on the client side:

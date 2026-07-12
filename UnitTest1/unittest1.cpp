@@ -2063,6 +2063,13 @@ namespace UnitTest1
             Assert::AreEqual(ret, 0);
         }
 
+        TEST_METHOD(qmux_loop_tls_sni)
+        {
+            int ret = qmux_loop_tls_sni_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
         TEST_METHOD(qmux_tls_client_alpn_required)
         {
             int ret = qmux_tls_client_alpn_required_test();
@@ -2900,6 +2907,241 @@ namespace UnitTest1
         TEST_METHOD(cert_verify_invalid)
         {
             int ret = cert_verify_invalid_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_exact_first) {
+            int ret = sni_exact_first_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_exact_second) {
+            int ret = sni_exact_second_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_case_insensitive) {
+            int ret = sni_case_insensitive_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_wildcard) {
+            int ret = sni_wildcard_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_wildcard_one_label) {
+            int ret = sni_wildcard_one_label_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_exact_precedence) {
+            int ret = sni_exact_precedence_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_unknown_fallback) {
+            int ret = sni_unknown_fallback_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_absent_fallback) {
+            int ret = sni_absent_fallback_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_selector_use_default) {
+            int ret = sni_selector_use_default_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_selector_selected) {
+            int ret = sni_selector_selected_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_selector_fallthrough) {
+            int ret = sni_selector_fallthrough_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_selector_reject) {
+            int ret = sni_selector_reject_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_cross_quic) {
+            int ret = sni_cross_quic_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_malformed_name) {
+            int ret = sni_malformed_name_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_replace_entry) {
+            int ret = sni_replace_entry_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_remove_entry) {
+            int ret = sni_remove_entry_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_resumption_boundary) {
+            int ret = sni_resumption_boundary_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_hrr) {
+            int ret = sni_hrr_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_config_freeze) {
+            int ret = sni_config_freeze_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_teardown) {
+            int ret = sni_teardown_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_resume) {
+            int ret = sni_scope_resume_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_remove) {
+            int ret = sni_scope_remove_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_replace) {
+            int ret = sni_scope_replace_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_selector) {
+            int ret = sni_scope_selector_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_legacy) {
+            int ret = sni_scope_legacy_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_wildcard) {
+            int ret = sni_scope_wildcard_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_selector_routing) {
+            int ret = sni_scope_selector_routing_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_scope_zero) {
+            int ret = sni_scope_zero_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_verifier_custom) {
+            int ret = sni_verifier_custom_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_verifier_roots) {
+            int ret = sni_verifier_roots_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_verifier_lifetime) {
+            int ret = sni_verifier_lifetime_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_verifier_refresh) {
+            int ret = sni_verifier_refresh_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+
+        TEST_METHOD(sni_verifier_reinstall) {
+            int ret = sni_verifier_reinstall_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_verifier_rollback) {
+            int ret = sni_verifier_rollback_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_legacy_names) {
+            int ret = sni_legacy_names_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_strict_names) {
+            int ret = sni_strict_names_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_keylog) {
+            int ret = sni_keylog_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_client_from_server_ctx) {
+            int ret = sni_client_from_server_ctx_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(sni_ech_identity) {
+            int ret = sni_ech_identity_test();
 
             Assert::AreEqual(ret, 0);
         }

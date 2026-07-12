@@ -114,6 +114,7 @@ extern "C" {
 #define PICOQUIC_ERROR_PADDING_PACKET (PICOQUIC_ERROR_CLASS + 70)
 #define PICOQUIC_ERROR_PACKET_TOO_BIG (PICOQUIC_ERROR_CLASS + 71)
 #define PICOQUIC_ERROR_OFFSET_TOO_BIG (PICOQUIC_ERROR_CLASS + 72)
+#define PICOQUIC_ERROR_TLS_CONFIG_FROZEN (PICOQUIC_ERROR_CLASS + 73)
 /*
  * Protocol errors defined in the QUIC spec
  */
@@ -550,6 +551,215 @@ char const* picoquic_tls_get_negotiated_alpn(picoquic_cnx_t* cnx);
 /* After the handshake, get the value of the SNI. */
 char const* picoquic_tls_get_sni(picoquic_cnx_t* cnx);
 
+/* Server-side SNI virtual hosts.
+ *
+ * A server can present different TLS identities (certificate chain and
+ * signing key) to different clients, selected by the server name (SNI)
+ * received in the ClientHello. Identities are preloaded, immutable
+ * objects created from certificate and key files:
+ *
+ *     picoquic_server_identity_t* identity = NULL;
+ *     ret = picoquic_server_identity_create(quic, cert_file, key_file, &identity);
+ *
+ * An identity snapshots the TLS configuration of the QUIC context at
+ * creation time. Context-wide TLS configuration (cipher suites, key
+ * exchanges, client authentication, etc.) must be completed before the
+ * first identity is created; once an identity exists that configuration
+ * is frozen and the corresponding setters fail with
+ * PICOQUIC_ERROR_TLS_CONFIG_FROZEN (or are ignored, for setters that
+ * return void). picoquic_refresh_tls_certificate() remains allowed and
+ * refreshes only the default (fallback) certificate.
+ *
+ * Identities are bound to the QUIC context that created them and cannot
+ * be used with another context. The opaque identity HANDLE itself is
+ * not reference counted: picoquic_server_identity_release() invalidates
+ * it immediately. What is reference counted is the underlying TLS
+ * context. Registry entries and connections retain that context, not
+ * the handle, so releasing a handle never affects registered entries
+ * or connections that already selected the identity. Registry-only
+ * users may therefore release the handle right after registration. A
+ * selector callback, however, returns the handle itself: keep it alive
+ * for as long as the selector may return it, even if the same identity
+ * is also registered. Identity handles not yet released when
+ * picoquic_free() is called are released by picoquic_free(); handles
+ * must not be used after that point.
+ *
+ * The simple way to use identities is the built-in name registry:
+ *
+ *     ret = picoquic_set_server_identity(quic, "alpha.example.com", identity, my_vhost);
+ *     ret = picoquic_set_server_identity(quic, "*.beta.example.net", identity2, my_vhost2);
+ *
+ * Each registry entry also carries a resumption scope (see
+ * picoquic_server_resumption_scope_t); the plain registration
+ * API generates a fresh scope on every call, so replacing an entry
+ * invalidates previously issued session tickets for that name. Use
+ * picoquic_set_server_identity_ex() with a persisted scope to keep
+ * resumption working across certificate rotation or restarts.
+ *
+ * Name patterns are DNS names, matched ASCII-case-insensitively; an
+ * exact pattern takes precedence over a wildcard pattern. A wildcard is
+ * only accepted as the complete leftmost label ("*.example.com") and
+ * matches exactly one label, following RFC 9525. Internationalized
+ * names must be given in A-label (punycode) form; no Unicode processing
+ * is performed. Registering a pattern again replaces the previous
+ * entry: new handshakes use the new identity, existing connections keep
+ * the identity they selected. picoquic_remove_server_identity() removes
+ * an entry, releasing only the registry's reference.
+ *
+ * If the ClientHello carries no SNI, or the SNI matches no registry
+ * entry, the server uses the default certificate configured with
+ * picoquic_create(), which is the pre-existing behavior. Once SNI
+ * selection has been enabled (a sticky property: it stays on even after
+ * entries and the selector are removed), a malformed SNI fails the
+ * handshake with a TLS illegal_parameter alert. A malformed SNI is
+ * anything that is not a well-formed DNS host name: more than 253
+ * octets, a label empty or longer than 63 octets, a leading or trailing
+ * dot, characters outside letters, digits and hyphen, a hyphen at the
+ * start or end of a label, or an all-digit final label (an IP literal
+ * is not a host name). A
+ * server that never enables SNI selection keeps the legacy behavior of
+ * accepting arbitrary SNI values; such nonconforming names remain
+ * visible through picoquic_tls_get_sni() (a C-string accessor: a name
+ * with an embedded NUL cannot be fully represented by it), while the
+ * connection's internal copy of the SNI is only made for validated
+ * names. Registry patterns are always validated, regardless of
+ * wire-validation mode.
+ *
+ * The default scope used when no registry entry matches (and for
+ * selector use_default) is generated randomly when SNI selection is
+ * first enabled and is process-local: fallback resumption does not
+ * survive a restart on scope-enabled servers unless a selector
+ * supplies a persisted stable scope for those selections.
+ *
+ * The optional per-vhost pointer ("server_name_ctx") registered with an
+ * entry is stored on every connection that selects that entry and can
+ * be retrieved with picoquic_get_server_name_context(), e.g. from the
+ * connection callback, to route the connection to per-vhost application
+ * state. The pointer is borrowed: picoquic stores it but never frees
+ * it, and the application must keep it valid for as long as any
+ * connection may have selected it.
+ *
+ * Applications that need full control over selection (many names, a
+ * dynamic certificate store, strict rejection of unknown names) can
+ * install a selector callback instead of, or in addition to, the
+ * registry. The callback runs during ClientHello processing, before the
+ * server certificate is chosen. It receives a read-only view of the
+ * ClientHello (pointers are only valid for the duration of the call,
+ * and the server name is length-delimited, NOT NUL-terminated) and
+ * decides how selection proceeds:
+ *
+ *  - picoquic_server_identity_result_selected: use the identity written
+ *    to *identity (must be non-NULL and created by the same QUIC
+ *    context; anything else fails the handshake with a TLS
+ *    internal_error alert).
+ *  - picoquic_server_identity_result_fallthrough: consult the registry,
+ *    then the default certificate.
+ *  - picoquic_server_identity_result_use_default: use the default
+ *    certificate, bypassing the registry.
+ *  - picoquic_server_identity_result_reject: fail the handshake with a
+ *    TLS unrecognized_name alert.
+ *
+ * The callback may also set *server_name_ctx; a registry match
+ * overwrites it with the entry's value.
+ *
+ * With no selector and no registry entries configured, server behavior
+ * is unchanged from previous versions of the library.
+ */
+typedef struct st_picoquic_server_identity_t picoquic_server_identity_t;
+
+/* Resumption scope: the tenant boundary for session resumption.
+ *
+ * SNI alone is not a sufficient boundary for session tickets: a name
+ * can be removed from the registry or reassigned to a different
+ * identity, and a ticket issued before that change would otherwise
+ * still resume. That would route the resumed connection, and any
+ * 0-RTT data, into a different application context than the one the
+ * ticket was issued under. Each registry entry therefore carries a resumption
+ * scope, and tickets only resume when the scope selected for the new
+ * connection matches the scope the ticket was issued under. PSK and
+ * 0-RTT can never move between different scopes.
+ *
+ * The all-zero value means "no stable scope": when a selector decides
+ * a connection (selected, use_default, or fallthrough with no registry
+ * match) without supplying a scope, and the selection carries a
+ * routing context, resumption is effectively disabled for that
+ * connection (tickets are issued, but bound to a scope that no later
+ * connection will reproduce). Registering an explicit all-zero scope
+ * is refused.
+ *
+ * Scopes are opaque random values. Callers that need resumption to
+ * survive certificate rotation or a process restart must generate a
+ * scope once (picoquic_server_resumption_scope_random), persist it,
+ * and pass it explicitly to picoquic_set_server_identity_ex(); the
+ * plain registration APIs generate a fresh scope on every
+ * registration, deliberately invalidating prior tickets. */
+#define PICOQUIC_SERVER_RESUMPTION_SCOPE_SIZE 16
+
+typedef struct st_picoquic_server_resumption_scope_t {
+    uint8_t id[PICOQUIC_SERVER_RESUMPTION_SCOPE_SIZE];
+} picoquic_server_resumption_scope_t;
+
+/* Fill *scope with cryptographically random bytes. */
+void picoquic_server_resumption_scope_random(picoquic_quic_t* quic,
+    picoquic_server_resumption_scope_t* scope);
+
+typedef struct st_picoquic_client_hello_info_t {
+    const uint8_t* server_name; /* Length-delimited, not NUL-terminated. NULL if absent. */
+    size_t server_name_length;
+    const picoquic_iovec_t* alpn_list;
+    size_t alpn_count;
+    const uint16_t* signature_algorithms;
+    size_t signature_algorithms_count;
+    const uint16_t* certificate_compression_algorithms;
+    size_t certificate_compression_algorithms_count;
+    const uint8_t* server_certificate_types;
+    size_t server_certificate_types_count;
+} picoquic_client_hello_info_t;
+
+typedef enum {
+    picoquic_server_identity_result_selected = 0,
+    picoquic_server_identity_result_fallthrough,
+    picoquic_server_identity_result_use_default,
+    picoquic_server_identity_result_reject
+} picoquic_server_identity_result_t;
+
+/* The resumption_scope output is initialized to all-zero. A selector
+ * that wants resumption to work across connections must copy a stable
+ * configured scope into it; the scope applies to every result the
+ * selector fully decides (selected, use_default, and fallthrough with
+ * no registry match). Leaving it zero disables resumption for any
+ * selection that carries a routing context; with neither scope nor
+ * routing context, the shared default scope applies. A registry match
+ * overrides both the routing context and the scope. */
+typedef picoquic_server_identity_result_t (*picoquic_server_identity_select_fn)(
+    picoquic_cnx_t* cnx, const picoquic_client_hello_info_t* hello,
+    picoquic_server_identity_t** identity, void** server_name_ctx,
+    picoquic_server_resumption_scope_t* resumption_scope, void* select_ctx);
+
+int picoquic_server_identity_create(picoquic_quic_t* quic,
+    char const* cert_file_name, char const* key_file_name,
+    picoquic_server_identity_t** identity);
+void picoquic_server_identity_release(picoquic_server_identity_t* identity);
+
+void picoquic_set_server_identity_select_fn(picoquic_quic_t* quic,
+    picoquic_server_identity_select_fn select_fn, void* select_ctx);
+
+/* Register an identity with an explicit resumption scope. With
+ * scope == NULL a fresh random scope is generated, both for new
+ * entries and when replacing an existing entry, so plain replacement
+ * invalidates previously issued tickets. Passing the same explicit
+ * scope again permits certificate-only rotation without invalidating
+ * tickets. Removing an entry and re-adding it without an explicit
+ * scope creates a new scope. */
+int picoquic_set_server_identity_ex(picoquic_quic_t* quic, char const* name_pattern,
+    picoquic_server_identity_t* identity, void* server_name_ctx,
+    const picoquic_server_resumption_scope_t* scope);
+int picoquic_set_server_identity(picoquic_quic_t* quic, char const* name_pattern,
+    picoquic_server_identity_t* identity, void* server_name_ctx);
+int picoquic_remove_server_identity(picoquic_quic_t* quic, char const* name_pattern);
+
+void* picoquic_get_server_name_context(picoquic_cnx_t* cnx);
+
 /* Callback function for producing a connection ID compatible
  * with the server environment.
  */
@@ -799,8 +1009,35 @@ void picoquic_set_null_verifier(picoquic_quic_t* quic);
 /* Set the TLS private key(DER format) for the QUIC context. The caller is responsible for cleaning up the pointer. */
 int picoquic_set_tls_key(picoquic_quic_t* quic, const uint8_t* data, size_t len);
 
-/* Set the verify certificate callback and context. */
-void picoquic_set_verify_certificate_callback(picoquic_quic_t* quic, 
+/* Set the verify certificate callback and context, with error
+ * reporting. Returns 0 on success,
+ * PICOQUIC_ERROR_TLS_CONFIG_FROZEN once server identities have frozen
+ * the TLS configuration, or PICOQUIC_ERROR_MEMORY if the ownership
+ * record cannot be allocated. For a callback not already owned by this
+ * QUIC context, ownership transfers only on success: on failure the
+ * previously installed verifier stays active and the caller keeps
+ * ownership of (and must dispose) the callback it passed in. A callback
+ * already owned anywhere in this context (currently active, or
+ * retained by a TLS context a connection kept across a certificate
+ * refresh) keeps its existing ownership unchanged: reinstalling it
+ * with the same cleanup function is an idempotent success, while
+ * passing a different cleanup function returns
+ * PICOQUIC_ERROR_UNEXPECTED_ERROR and changes nothing (its cleanup is
+ * neither replaced nor invoked). */
+int picoquic_set_verify_certificate_callback_ex(picoquic_quic_t* quic,
+    ptls_verify_certificate_t * cb, picoquic_free_verify_certificate_ctx free_fn);
+
+/* Set the verify certificate callback and context: the historical API,
+ * kept source compatible. It behaves like
+ * picoquic_set_verify_certificate_callback_ex() but cannot report
+ * errors, so it preserves the historical ownership contract for
+ * callers that cannot observe failure: on failure it logs and disposes
+ * a newly supplied, not-yet-owned callback, but never disposes or
+ * alters a callback already owned anywhere in this context (active or
+ * retained across a certificate refresh), in particular when an
+ * already-owned callback is passed again. Use the _ex variant to
+ * observe errors and retain ownership on failure. */
+void picoquic_set_verify_certificate_callback(picoquic_quic_t* quic,
     ptls_verify_certificate_t * cb, picoquic_free_verify_certificate_ctx free_fn);
 
 /* Set client authentication in TLS (if enabled, client is required to send certificates). */

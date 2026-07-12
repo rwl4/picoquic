@@ -130,8 +130,15 @@ void * picoquic_hp_enc_create_for_test(int cipher_suite_id, const uint8_t * hp_k
 int picoquic_create_cnxid_reset_secret(picoquic_quic_t* quic, picoquic_connection_id_t * cnx_id,
     uint8_t reset_secret[PICOQUIC_RESET_SECRET_SIZE]);
 
-void picoquic_tls_set_verify_certificate_callback(picoquic_quic_t* quic,
+int picoquic_tls_set_verify_certificate_callback(picoquic_quic_t* quic,
     struct st_ptls_verify_certificate_t* cb, picoquic_free_verify_certificate_ctx free_fn);
+
+/* Returns non zero if cb is owned anywhere within this QUIC context:
+ * currently installed on the master TLS context, or held by a live
+ * verifier ownership record (e.g. through an old TLS context retained
+ * by a connection across a certificate refresh). */
+int picoquic_tls_verify_callback_is_owned(picoquic_quic_t* quic,
+    struct st_ptls_verify_certificate_t* cb);
 
 void picoquic_dispose_verify_certificate_callback(picoquic_quic_t* quic);
 
@@ -206,6 +213,20 @@ void picoquic_tls_api_unload(void);
 void picoquic_tls_api_reset(uint64_t init_flags);
 
 void picoquic_tls_api_log_versions(picoquic_cnx_t* cnx);
+
+
+/* Returns non zero (and logs) if TLS configuration on this context is
+ * frozen because server identities exist. Used to guard the
+ * context-wide TLS configuration setters. */
+int picoquic_tls_config_is_frozen(picoquic_quic_t* quic, char const* setter_name);
+
+/* Unconditional ECH context cleanup (ignores the configuration freeze),
+ * used when the QUIC context is being deleted. */
+void picoquic_release_quic_ech_ctx_internal(picoquic_quic_t* quic);
+
+/* Called from picoquic_free() to release the SNI registry and any
+ * server identities the application did not release. */
+void picoquic_free_server_identities(picoquic_quic_t* quic);
 
 #ifdef __cplusplus
 }

@@ -1438,6 +1438,84 @@ int qmux_loop_tls_test(void)
     return qmux_loop_one(&spec);
 }
 
+/* A QMux server that selects an SNI identity must still complete the
+ * handshake: the identity context is cloned from the QMux master
+ * context, which disables the QUIC traffic-key callback, and that
+ * disabled state must be preserved in the clone (otherwise the
+ * handshake fails, ret = 40). The accepted server connection must also
+ * carry the identity's server_name_ctx. */
+static int qmux_sni_vhost_sentinel;
+
+int qmux_loop_tls_sni_test(void)
+{
+    qmux_sim_ctx_t sim_ctx;
+    qmux_sim_spec_t spec = { 0 };
+    picoquic_server_identity_t* identity = NULL;
+    char test_server_cert_file[512];
+    char test_server_key_file[512];
+    int ret;
+
+    spec.is_cleartext = 0;
+    spec.idle_timeout = 15000;
+    spec.expected_time = 90000;
+
+    ret = qmux_test_init(&sim_ctx, &spec);
+
+    if (ret == 0) {
+        ret = picoquic_get_input_path(test_server_cert_file, sizeof(test_server_cert_file),
+            picoquic_solution_dir, PICOQUIC_TEST_FILE_SERVER_CERT);
+    }
+    if (ret == 0) {
+        ret = picoquic_get_input_path(test_server_key_file, sizeof(test_server_key_file),
+            picoquic_solution_dir, PICOQUIC_TEST_FILE_SERVER_KEY);
+    }
+    if (ret == 0) {
+        /* Register an SNI identity on the QMux server for the name the
+         * client sends, then drop the application handle. */
+        ret = picoquic_server_identity_create(sim_ctx.quic[1], test_server_cert_file,
+            test_server_key_file, &identity);
+        if (ret == 0) {
+            ret = picoquic_set_server_identity(sim_ctx.quic[1], PICOQUIC_TEST_SNI,
+                identity, &qmux_sni_vhost_sentinel);
+            picoquic_server_identity_release(identity);
+        }
+    }
+
+    /* Start the loop by creating a client connection. */
+    if (ret == 0 &&
+        (sim_ctx.cnx[0] = picoqmux_create_qmux_cnx(sim_ctx.quic[0],
+            sim_ctx.simulated_time, 1, spec.is_cleartext, PICOQUIC_TEST_SNI,
+            "qmux_test", NULL)) == NULL) {
+        ret = -1;
+    }
+
+    while (ret == 0) {
+        if ((ret = qmux_loop_iterate(&sim_ctx)) == 0 &&
+            sim_ctx.cnx[0]->cnx_state == picoquic_state_disconnected) {
+            break;
+        }
+    }
+
+    if (ret == 0) {
+        if (sim_ctx.cnx[1] == NULL) {
+            DBG_PRINTF("%s", "QMux SNI: no server connection");
+            ret = -1;
+        }
+        else if (sim_ctx.simulated_time > spec.expected_time) {
+            DBG_PRINTF("%s", "QMux SNI: handshake too slow");
+            ret = -1;
+        }
+        else if (picoquic_get_server_name_context(sim_ctx.cnx[1]) !=
+            &qmux_sni_vhost_sentinel) {
+            DBG_PRINTF("%s", "QMux SNI: server name context not set from the identity");
+            ret = -1;
+        }
+    }
+
+    qmux_test_release(&sim_ctx);
+    return ret;
+}
+
 int qmux_loop_tls_close_test(void)
 {
     qmux_sim_spec_t spec = { 0 };

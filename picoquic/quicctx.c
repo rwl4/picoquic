@@ -1072,8 +1072,10 @@ void picoquic_free(picoquic_quic_t* quic)
             picoquic_delete_cnx(quic->cnx_list);
         }
 
-        /* Delete ECH context if it was created */
-        picoquic_release_quic_ech_ctx(quic);
+        /* Delete ECH context if it was created. Unconditional: the
+         * public release is a no-op once identities freeze the config,
+         * but teardown must always free the opener. */
+        picoquic_release_quic_ech_ctx_internal(quic);
 
         /* Delete TLS and AEAD cntexts */
         picoquic_delete_retry_protection_contexts(quic);
@@ -1145,10 +1147,15 @@ void picoquic_free(picoquic_quic_t* quic)
             picoquic_dispose_verify_certificate_callback(quic);
         }
 
-        /* Delete the picotls context */
-        if (quic->tls_master_ctx != NULL) {
-            picoquic_master_tlscontext_free(quic);
-        }
+        /* Release the SNI registry and any remaining server identities.
+         * All connections are deleted by now, so this drops the last
+         * references to the identity TLS contexts. */
+        picoquic_free_server_identities(quic);
+
+        /* Delete the picotls context. Called unconditionally: even
+         * when master context creation failed, the key log sink may
+         * already exist and is released here. */
+        picoquic_master_tlscontext_free(quic);
 
         /* Close the logs */
         picoquic_log_close_logs(quic);
@@ -1166,12 +1173,18 @@ void picoquic_free(picoquic_quic_t* quic)
 int picoquic_set_low_memory_mode(picoquic_quic_t* quic, int low_memory_mode)
 {
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_low_memory_mode")) {
+        return PICOQUIC_ERROR_TLS_CONFIG_FROZEN;
+    }
     quic->use_low_memory = (low_memory_mode == 0) ? 0 : 1;
     return picoquic_set_cipher_suite(quic, 0);
 }
 
 void picoquic_set_null_verifier(picoquic_quic_t* quic) {
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_null_verifier")) {
+        return;
+    }
     picoquic_dispose_verify_certificate_callback(quic);
 }
 
@@ -5151,12 +5164,31 @@ void picoquic_disable_keep_alive(picoquic_cnx_t* cnx)
     cnx->keep_alive_interval = 0;
 }
 
-void picoquic_set_verify_certificate_callback(picoquic_quic_t* quic, 
+int picoquic_set_verify_certificate_callback_ex(picoquic_quic_t* quic,
     ptls_verify_certificate_t * cb, picoquic_free_verify_certificate_ctx free_fn) {
     PICOQUIC_THREAD_CHECK(quic);
-    picoquic_dispose_verify_certificate_callback(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_verify_certificate_callback")) {
+        return PICOQUIC_ERROR_TLS_CONFIG_FROZEN;
+    }
+    return picoquic_tls_set_verify_certificate_callback(quic, cb, free_fn);
+}
 
-    picoquic_tls_set_verify_certificate_callback(quic, cb, free_fn);
+void picoquic_set_verify_certificate_callback(picoquic_quic_t* quic,
+    ptls_verify_certificate_t * cb, picoquic_free_verify_certificate_ctx free_fn) {
+    int ret = picoquic_set_verify_certificate_callback_ex(quic, cb, free_fn);
+
+    if (ret != 0) {
+        DBG_PRINTF("Cannot set the verify certificate callback, ret = 0x%x", ret);
+        /* Callers of the historical void API handed over ownership and
+         * cannot observe the failure: dispose the incoming callback --
+         * unless it is already owned anywhere in this context (active,
+         * or retained by a TLS context kept across a certificate
+         * refresh), in which case it must remain installed and
+         * untouched. */
+        if (free_fn != NULL && !picoquic_tls_verify_callback_is_owned(quic, cb)) {
+            free_fn(cb);
+        }
+    }
 }
 
 int picoquic_is_client(picoquic_cnx_t* cnx)
@@ -5210,11 +5242,17 @@ uint64_t picoquic_get_data_received(picoquic_cnx_t* cnx)
 
 void picoquic_set_client_authentication(picoquic_quic_t* quic, int client_authentication) {
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_client_authentication")) {
+        return;
+    }
     picoquic_tls_set_client_authentication(quic, client_authentication);
 }
 
 void picoquic_set_use_exporter(picoquic_quic_t* quic, int use_exporter) {
     PICOQUIC_THREAD_CHECK(quic);
+    if (picoquic_tls_config_is_frozen(quic, "picoquic_set_use_exporter")) {
+        return;
+    }
     picoquic_tls_set_use_exporter(quic, use_exporter);
 }
 
