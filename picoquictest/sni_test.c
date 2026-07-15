@@ -566,6 +566,16 @@ int sni_selector_selected_test(void)
         ret = -1;
     }
 
+    if (ret == 0) {
+        /* Returning selected while leaving *identity NULL is an
+         * application error; it must fail the handshake with a TLS
+         * internal_error alert, not dereference the missing identity. */
+        memset(&state, 0, sizeof(state));
+        state.behavior = picoquic_server_identity_result_selected;
+        ret = sni_test_one_selector(&state, SNI_TEST_NAME_BETA, NULL, 0, NULL,
+            SNI_TEST_ALERT_INTERNAL_ERROR, 0);
+    }
+
     return ret;
 }
 
@@ -575,13 +585,33 @@ int sni_selector_selected_test(void)
  * null verifier and the test asserts the entry's context. */
 int sni_selector_fallthrough_test(void)
 {
+    int ret;
     sni_test_selector_state_t state;
     memset(&state, 0, sizeof(state));
     state.behavior = picoquic_server_identity_result_fallthrough;
     state.server_name_ctx_out = (void*)&sni_test_vhost_callback;
 
-    return sni_test_one_selector(&state, SNI_TEST_NAME_BETA, NULL, 1,
+    ret = sni_test_one_selector(&state, SNI_TEST_NAME_BETA, NULL, 1,
         (void*)&sni_test_vhost_alpha, 0, 0);
+
+    if (ret == 0) {
+        /* When the ClientHello carries no SNI the selector still runs
+         * and must see a NULL server name; fallthrough then finds no
+         * registry match, so the default certificate is presented and
+         * the callback's routing context is retained. */
+        memset(&state, 0, sizeof(state));
+        state.behavior = picoquic_server_identity_result_fallthrough;
+        state.server_name_ctx_out = (void*)&sni_test_vhost_callback;
+        ret = sni_test_one_selector(&state, NULL, NULL, 1,
+            (void*)&sni_test_vhost_callback, 0, 0);
+        if (ret == 0 && state.saw_server_name) {
+            DBG_PRINTF("Selector saw server name '%s', expected none",
+                state.server_name_seen);
+            ret = -1;
+        }
+    }
+
+    return ret;
 }
 
 /* reject fails the handshake with a TLS unrecognized_name alert. */
@@ -670,18 +700,28 @@ int sni_malformed_name_test(void)
     uint64_t simulated_time = 0;
     char cert_path[512];
     char key_path[512];
+    /* Building blocks for the total-length boundary: labels at the
+     * 63-octet limit, plus a 61-octet one so that four labels and three
+     * dots come to exactly 253 octets. */
+#define SNI_TEST_LABEL_63 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define SNI_TEST_LABEL_61 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     /* Well-formed DNS names: registering each as an exact pattern must
      * succeed. */
     static char const* valid_names[] = {
         "alpha.example.com", "a.b", "9started.example.com", "x-y.example.com", "localhost",
-        "1.2.3.4.example.com", "example.123a", "9started", "x-y.example"
+        "1.2.3.4.example.com", "example.123a", "9started", "x-y.example",
+        /* 253 octets, the largest well-formed host name. */
+        SNI_TEST_LABEL_63 "." SNI_TEST_LABEL_63 "." SNI_TEST_LABEL_63 "." SNI_TEST_LABEL_61
     };
     /* Not well-formed: registering each must be refused. */
     static char const* invalid_names[] = {
         "a..example.com", ".example.com", "example.com.",
         "caf\xc3\xa9.example.com", "a b.example.com", "a\texample.com",
         "-a.example.com", "a-.example.com", "a_b.example.com",
-        "192.0.2.1", "999.999.999.999", "example.123", "123"
+        "192.0.2.1", "999.999.999.999", "example.123", "123",
+        /* 255 octets: every label is valid but the name as a whole
+         * exceeds the 253-octet limit. */
+        SNI_TEST_LABEL_63 "." SNI_TEST_LABEL_63 "." SNI_TEST_LABEL_63 "." SNI_TEST_LABEL_63
     };
     /* Invalid registration patterns, including wildcard-specific forms. */
     static char const* bad_patterns[] = {
@@ -979,7 +1019,8 @@ typedef enum {
     sni_scope_case_legacy, /* no selector or registry: legacy ticket binding, resumes */
     sni_scope_case_legacy_then_scoped, /* legacy ticket, then scoping enabled: no resumption */
     sni_scope_case_wildcard, /* wildcard entry keeps its scope: resumes */
-    sni_scope_case_wildcard_exact_override /* exact entry added over the wildcard: no resumption */
+    sni_scope_case_wildcard_exact_override, /* exact entry added over the wildcard: no resumption */
+    sni_scope_case_default_fallback /* unmatched name on a scope-enabled server: the default scope is process-local, no cross-instance resumption */
 } sni_scope_case_enum;
 
 static sni_test_selector_state_t sni_scope_selector_state;
@@ -1024,6 +1065,7 @@ static int sni_scope_server_setup(picoquic_quic_t* qserver, sni_scope_case_enum 
 
     switch (which) {
     case sni_scope_case_control:
+    case sni_scope_case_default_fallback:
         ret = sni_scope_register_ex(qserver, SNI_TEST_NAME_ALPHA,
             PICOQUIC_TEST_FILE_SNI_CERT_ALPHA, PICOQUIC_TEST_FILE_SNI_KEY_ALPHA,
             (void*)&sni_test_vhost_alpha, &sni_scope_stable);
@@ -1204,11 +1246,19 @@ static int sni_scope_test_one(sni_scope_case_enum which, char const* sni,
     return ret;
 }
 
-/* Same SNI and unchanged registry scope: resumption and 0-RTT work. */
+/* Same SNI and unchanged registry scope: resumption and 0-RTT work.
+ * By contrast, a ticket issued to an unmatched name is bound to the
+ * server's process-local default scope, so it must not resume on a
+ * recreated server even when the registry is configured identically. */
 int sni_scope_resume_test(void)
 {
-    return sni_scope_test_one(sni_scope_case_control, SNI_TEST_NAME_ALPHA, 1,
+    int ret = sni_scope_test_one(sni_scope_case_control, SNI_TEST_NAME_ALPHA, 1,
         (void*)&sni_test_vhost_alpha);
+    if (ret == 0) {
+        ret = sni_scope_test_one(sni_scope_case_default_fallback,
+            SNI_TEST_NAME_UNKNOWN, 0, NULL);
+    }
+    return ret;
 }
 
 /* Removing the entry invalidates its tickets: the reconnection falls
