@@ -679,6 +679,7 @@ int quicperf_multi_test(void);
 int quicperf_overflow_test(void);
 int cplusplustest(void);
 int error_name_test(void);
+int initial_short_bounds_test(void);
 int public_random_thread_test(void);
 
 #ifdef __cplusplus

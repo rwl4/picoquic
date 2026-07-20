@@ -1658,18 +1658,35 @@ int picoquic_incoming_server_initial(
                 /* empty payload! */
                 ret = picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, 0);
             }
+            else if (ph->offset > packet_length ||
+                ph->payload_length > packet_length - ph->offset) {
+                /* The header-declared payload span does not fit inside the
+                 * received packet. Reject it here, before the short-packet
+                 * scan OR picoquic_decode_frames can ever be handed the
+                 * invalid span. The checks use subtraction so they cannot
+                 * overflow. */
+                ret = PICOQUIC_ERROR_PACKET_HEADER_PARSING;
+            }
             else {
                 /* Verify that the packet is long enough */
                 if (packet_length < PICOQUIC_ENFORCED_INITIAL_MTU) {
+                    /* The payload span was validated against the packet
+                     * length above. The remaining length passed to
+                     * picoquic_skip_frame is measured from the current
+                     * byte index to the end of the payload; byte_index is
+                     * an absolute index in the packet, so the payload
+                     * length alone would underflow once byte_index
+                     * exceeds it. */
                     size_t byte_index = ph->offset;
+                    size_t payload_last = ph->offset + ph->payload_length;
                     int ack_needed = 0;
                     int skip_ret = 0;
 
-                    while (skip_ret == 0 && byte_index < ph->offset + ph->payload_length) {
+                    while (skip_ret == 0 && byte_index < payload_last) {
                         size_t frame_length = 0;
                         int frame_is_pure_ack = 0;
                         skip_ret = picoquic_skip_frame(&bytes[byte_index],
-                            ph->payload_length - byte_index, &frame_length, &frame_is_pure_ack);
+                            payload_last - byte_index, &frame_length, &frame_is_pure_ack);
                         byte_index += frame_length;
                         if (frame_is_pure_ack == 0) {
                             ack_needed = 1;

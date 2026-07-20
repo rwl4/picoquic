@@ -2298,3 +2298,110 @@ int error_name_test(void)
     }
     return ret;
 }
+
+/* Regression test for the payload span computation in
+* picoquic_incoming_server_initial. The function scans the frames of a
+* short server Initial packet to decide whether it needs to be
+* acknowledged. The byte index used during the scan is an absolute index
+* in the packet, starting at ph->offset, while the span passed to
+* picoquic_skip_frame used to be computed from the payload length alone;
+* as soon as the packet had a nonzero payload offset the subtraction
+* underflowed, and picoquic_skip_frame was called with a huge length
+* (caught by UBSan as a pointer overflow in the bytes_max computation).
+*
+* The test builds a minimal short Initial (nonzero offset, 4 byte
+* payload) and feeds it to picoquic_incoming_server_initial directly:
+* - a PING payload must be classified as ack-eliciting, so the
+*   "initial too short" check must trip;
+* - an all-PADDING payload must scan to the exact end of the payload
+*   and be accepted.
+*/
+int picoquic_incoming_server_initial(
+    picoquic_cnx_t* cnx,
+    uint8_t* bytes,
+    size_t packet_length,
+    picoquic_stream_data_node_t* received_data,
+    struct sockaddr* addr_to,
+    unsigned long if_index_to,
+    picoquic_packet_header* ph,
+    uint64_t current_time);
+
+static int initial_short_bounds_case(picoquic_test_tls_api_ctx_t* test_ctx,
+    uint64_t simulated_time, size_t test_offset, size_t test_payload_length,
+    size_t test_packet_length, uint8_t first_payload_byte, int expected_ret)
+{
+    int ret = 0;
+    uint8_t packet[64];
+    picoquic_packet_header ph;
+    picoquic_cnx_t* cnx = test_ctx->cnx_client;
+    int case_ret;
+
+    memset(packet, 0, sizeof(packet));
+    memset(&ph, 0, sizeof(ph));
+    if (test_offset < sizeof(packet)) {
+        packet[test_offset] = first_payload_byte;
+    }
+
+    ph.offset = test_offset;
+    ph.payload_length = test_payload_length;
+    ph.epoch = picoquic_epoch_initial;
+    ph.pn64 = 0;
+    /* Match the connection ID that the client expects from the server */
+    ph.srce_cnx_id = cnx->path[0]->first_tuple->p_remote_cnxid->cnx_id;
+
+    case_ret = picoquic_incoming_server_initial(cnx, packet,
+        test_packet_length, NULL, NULL, 0, &ph, simulated_time);
+
+    if (case_ret != expected_ret) {
+        DBG_PRINTF("Short initial (off %zu, pay %zu, len %zu): got 0x%x, expected 0x%x",
+            test_offset, test_payload_length, test_packet_length,
+            case_ret, expected_ret);
+        ret = -1;
+    }
+    return ret;
+}
+
+int initial_short_bounds_test(void)
+{
+    int ret = 0;
+    uint64_t simulated_time = 0;
+    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
+
+    ret = tls_api_init_ctx(&test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN,
+        &simulated_time, NULL, NULL, 0, 0, 0);
+
+    if (ret == 0 && test_ctx->cnx_client == NULL) {
+        ret = -1;
+    }
+    /* An all padding payload is not ack eliciting: the scan must walk to
+     * the exact end of the payload and accept the packet. */
+    if (ret == 0) {
+        ret = initial_short_bounds_case(test_ctx, simulated_time,
+            26, 4, 30, picoquic_frame_type_padding, 0);
+    }
+    /* A PING payload is ack eliciting: the too short check must trip. */
+    if (ret == 0) {
+        ret = initial_short_bounds_case(test_ctx, simulated_time,
+            26, 4, 30, picoquic_frame_type_ping,
+            PICOQUIC_ERROR_INITIAL_TOO_SHORT);
+    }
+    /* A header whose payload offset lies past the end of the packet must
+     * be rejected before any scan or decode sees the span. */
+    if (ret == 0) {
+        ret = initial_short_bounds_case(test_ctx, simulated_time,
+            65, 4, 64, picoquic_frame_type_padding,
+            PICOQUIC_ERROR_PACKET_HEADER_PARSING);
+    }
+    /* A header whose declared payload runs past the end of the packet
+     * must be rejected the same way. */
+    if (ret == 0) {
+        ret = initial_short_bounds_case(test_ctx, simulated_time,
+            26, 64, 30, picoquic_frame_type_padding,
+            PICOQUIC_ERROR_PACKET_HEADER_PARSING);
+    }
+
+    if (test_ctx != NULL) {
+        tls_api_delete_ctx(test_ctx);
+    }
+    return ret;
+}

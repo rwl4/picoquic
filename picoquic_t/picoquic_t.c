@@ -46,6 +46,7 @@ static const picoquic_test_def_t test_table[] = {
     { "connection_id_print", util_connection_id_print_test },
     { "connection_id_parse", util_connection_id_parse_test },
     { "error_name", error_name_test },
+    { "initial_short_bounds", initial_short_bounds_test },
     { "public_random_thread", public_random_thread_test },
     { "util_sprintf", util_sprintf_test },
     { "util_debug_print", util_debug_print_test },
