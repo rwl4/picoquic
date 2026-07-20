@@ -70,6 +70,9 @@
 #endif
 #include <stdio.h>
 #include <string.h>
+#ifndef _WINDOWS
+#include <pthread.h>
+#endif
 #include "picoquic_unified_log.h"
 
 #define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
@@ -964,6 +967,46 @@ static int public_random_index = 0;
 static const uint64_t public_random_multiplier = 1181783497276652981ull;
 static uint64_t public_random_obfuscator = 0x5555555555555555ull;
 
+/* The public random generator state (public_random_seed,
+* public_random_index, public_random_obfuscator) is process global and is
+* used from arbitrary threads: packet number obfuscation, pacing and
+* spin bit randomization, connection ID and ticket generation, while
+* picoquic_public_random_seed runs on whatever thread creates a QUIC
+* context. Every access to the state is therefore serialized by the
+* statically initialized lock below. Each public entry point performs
+* exactly one lock/unlock transaction; the "_in_lock" helpers implement
+* the generator steps and must only be called with the lock held, so
+* public entry points never nest the lock. The lock does not change the
+* generated sequence: a single threaded caller observes exactly the same
+* outputs as before.
+*/
+#ifdef _WINDOWS
+static SRWLOCK public_random_lock = SRWLOCK_INIT;
+
+static void picoquic_public_random_acquire(void)
+{
+    AcquireSRWLockExclusive(&public_random_lock);
+}
+
+static void picoquic_public_random_release(void)
+{
+    ReleaseSRWLockExclusive(&public_random_lock);
+}
+#else
+static pthread_mutex_t public_random_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void picoquic_public_random_acquire(void)
+{
+    (void)pthread_mutex_lock(&public_random_lock);
+}
+
+static void picoquic_public_random_release(void)
+{
+    (void)pthread_mutex_unlock(&public_random_lock);
+}
+#endif
+
+/* Call only with the public random lock held. */
 static uint64_t picoquic_public_random_step(void)
 {
     uint64_t s1;
@@ -977,7 +1020,8 @@ static uint64_t picoquic_public_random_step(void)
     return s1;
 }
 
-uint64_t picoquic_public_random_64(void)
+/* Call only with the public random lock held. */
+static uint64_t picoquic_public_random_64_in_lock(void)
 {
     uint64_t s1 = picoquic_public_random_step();
     s1 *= public_random_multiplier;
@@ -985,7 +1029,8 @@ uint64_t picoquic_public_random_64(void)
     return s1;
 }
 
-void picoquic_public_random_seed_64(uint64_t seed, int reset)
+/* Call only with the public random lock held. */
+static void picoquic_public_random_seed_64_in_lock(uint64_t seed, int reset)
 {
     if (reset) {
         public_random_index = 0;
@@ -1002,28 +1047,53 @@ void picoquic_public_random_seed_64(uint64_t seed, int reset)
     }
 }
 
+uint64_t picoquic_public_random_64(void)
+{
+    uint64_t s1;
+
+    picoquic_public_random_acquire();
+    s1 = picoquic_public_random_64_in_lock();
+    picoquic_public_random_release();
+
+    return s1;
+}
+
+void picoquic_public_random_seed_64(uint64_t seed, int reset)
+{
+    picoquic_public_random_acquire();
+    picoquic_public_random_seed_64_in_lock(seed, reset);
+    picoquic_public_random_release();
+}
 
 void picoquic_public_random_seed(picoquic_quic_t* quic)
 {
+    /* Gather the entropy before taking the lock: picoquic_crypto_random
+     * may do arbitrary work in the TLS provider, and the lock only
+     * protects the generator state. Seed and obfuscator are then applied
+     * in a single locked transaction. */
     uint64_t seed[3];
     picoquic_crypto_random(quic, &seed, sizeof(seed));
 
-    picoquic_public_random_seed_64(seed[0], 0);
+    picoquic_public_random_acquire();
+    picoquic_public_random_seed_64_in_lock(seed[0], 0);
     public_random_obfuscator = seed[1];
+    picoquic_public_random_release();
 }
 
 void picoquic_public_random(void* buf, size_t len)
 {
     uint8_t* x = buf;
 
+    picoquic_public_random_acquire();
     while (len > 0) {
-        uint64_t y = picoquic_public_random_64();
+        uint64_t y = picoquic_public_random_64_in_lock();
         for (int i = 0; i < 8 && len > 0; i++) {
             *x++ = (uint8_t)(y & 255);
             y >>= 8;
             len--;
         }
     }
+    picoquic_public_random_release();
 }
 
 uint64_t picoquic_public_uniform_random(uint64_t rnd_max)
@@ -1031,9 +1101,11 @@ uint64_t picoquic_public_uniform_random(uint64_t rnd_max)
     uint64_t rnd;
     uint64_t rnd_min = UINT64_MAX % rnd_max;
 
+    picoquic_public_random_acquire();
     do {
-        rnd = picoquic_public_random_64();
+        rnd = picoquic_public_random_64_in_lock();
     } while (rnd < rnd_min);
+    picoquic_public_random_release();
 
     return rnd % rnd_max;
 }

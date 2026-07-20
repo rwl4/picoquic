@@ -225,6 +225,7 @@ set(PICOQUIC_TEST_LIBRARY_FILES
     picoquictest/picolog_test.c
     picoquictest/picoquic_lb_test.c
     picoquictest/pn2pn64test.c
+    picoquictest/prng_test.c
     picoquictest/qlog_frame_test.c
     picoquictest/qlog_test.c
     picoquictest/qmux_test.c
