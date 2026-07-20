@@ -654,7 +654,7 @@ int picoquic_sample_background(char const* server_name, int server_port, char co
     * to wait until the completion of the transport. Here,
     * we simply resort to active polling.
      */
-    while (!thread_ctx->thread_is_closed) {
+    while (!picoquic_network_thread_is_closed(thread_ctx)) {
         if (client_ctx.is_disconnected) {
             printf("Disconnected.\n");
             break;

@@ -2378,6 +2378,36 @@ int picoquic_packet_loop_do_udp_send(
     return ret;
 }
 
+/* The network thread lifecycle flags (thread_is_ready, thread_should_close,
+* thread_is_closed) are shared between the network thread and application
+* threads. They are only accessed through the two helpers below, which
+* provide release/acquire semantics: the "set" is a release store, the
+* "get" an acquire load. This guarantees that values written before a flag
+* is set, such as the loop return code written before thread_is_closed,
+* are visible to a thread that observes the flag. The "volatile" qualifier
+* on the fields is historical; volatile alone does not synchronize threads.
+*/
+static void picoquic_thread_flag_set(volatile int* flag, int value)
+{
+#ifdef _WINDOWS
+    (void)InterlockedExchange((volatile LONG*)flag, (LONG)value);
+#else
+    __atomic_store_n(flag, value, __ATOMIC_RELEASE);
+#endif
+}
+
+static int picoquic_thread_flag_get(volatile int const* flag)
+{
+#ifdef _WINDOWS
+    /* InterlockedCompareExchange with 0/0 is a pure atomic read with full
+     * barrier semantics; the const is cast away because the Interlocked
+     * API takes a non const pointer, but the value is never changed. */
+    return (int)InterlockedCompareExchange((volatile LONG*)flag, 0, 0);
+#else
+    return __atomic_load_n(flag, __ATOMIC_ACQUIRE);
+#endif
+}
+
 #ifdef _WINDOWS
 DWORD WINAPI picoquic_packet_loop_v3(LPVOID v_ctx)
 #else
@@ -2517,7 +2547,7 @@ void* picoquic_packet_loop_v3(void* v_ctx)
     }
 
     if (ret == 0) {
-        thread_ctx->thread_is_ready = 1;
+        picoquic_thread_flag_set(&thread_ctx->thread_is_ready, 1);
     }
     else {
         DBG_PRINTF("%s", "Thread cannot run");
@@ -2526,7 +2556,7 @@ void* picoquic_packet_loop_v3(void* v_ctx)
     /* Wait for packets */
     /* TODO: add stopping condition, was && (!just_once || !connection_done) */
     /* Actually, no, rely on the callback return code for that? */
-    while (ret == 0 && !thread_ctx->thread_should_close) {
+    while (ret == 0 && !picoquic_thread_flag_get(&thread_ctx->thread_should_close)) {
         int socket_rank = -1;
         int64_t delta_t = 0;
         uint8_t received_ecn;
@@ -2628,7 +2658,7 @@ void* picoquic_packet_loop_v3(void* v_ctx)
 
         if (bytes_recv < 0) {
             /* The interrupt error is expected if the loop is closing. */
-            ret = (thread_ctx->thread_should_close) ? PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP : -1;
+            ret = (picoquic_thread_flag_get(&thread_ctx->thread_should_close)) ? PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP : -1;
         }
         else {
             /* First, process immediate actions */
@@ -2801,7 +2831,7 @@ void* picoquic_packet_loop_v3(void* v_ctx)
         }
     }
 
-    thread_ctx->thread_is_ready = 0;
+    picoquic_thread_flag_set(&thread_ctx->thread_is_ready, 0);
 #if defined(_WINDOWS)
 #elif defined(PICOQUIC_WITH_IO_URING)
     if (io_uring_is_init) {
@@ -2838,6 +2868,9 @@ void* picoquic_packet_loop_v3(void* v_ctx)
     }
 
     thread_ctx->return_code = ret;
+    /* Publish the loop termination. The release semantics of the flag set
+     * make the return code visible to threads that observe the flag. */
+    picoquic_thread_flag_set(&thread_ctx->thread_is_closed, 1);
 
 #ifdef _WINDOWS
     return (DWORD)ret;
@@ -2971,7 +3004,23 @@ static void picoquic_open_network_wake_up(picoquic_network_thread_ctx_t* thread_
     }
     else
     {
-        thread_ctx->wake_up_defined = 1;
+        /* The WRITE end is nonblocking so a wake -- including the one issued
+         * by picoquic_delete_network_thread -- can never block on a
+         * saturated pipe: if the pipe is full, a wake byte is already
+         * pending and the loop will wake, so EAGAIN is success, not failure.
+         * The read end stays blocking (it is only drained after poll/select
+         * reports it readable). */
+        int flags = fcntl(thread_ctx->wake_up_pipe_fd[1], F_GETFL, 0);
+        if (flags < 0 ||
+            fcntl(thread_ctx->wake_up_pipe_fd[1], F_SETFL,
+                flags | O_NONBLOCK) != 0) {
+            *ret = errno;
+            (void)close(thread_ctx->wake_up_pipe_fd[0]);
+            (void)close(thread_ctx->wake_up_pipe_fd[1]);
+        }
+        else {
+            thread_ctx->wake_up_defined = 1;
+        }
     }
 #endif
 }
@@ -3028,6 +3077,7 @@ picoquic_network_thread_ctx_t* picoquic_start_custom_network_thread_qmux(picoqui
 
     if (thread_ctx == NULL) {
         /* Error, no memory */
+        *ret = PICOQUIC_ERROR_MEMORY;
     }
     else {
         memset(thread_ctx, 0, sizeof(picoquic_network_thread_ctx_t));
@@ -3041,8 +3091,21 @@ picoquic_network_thread_ctx_t* picoquic_start_custom_network_thread_qmux(picoqui
         thread_ctx->loop_callback_ctx = loop_callback_ctx;
         /* Open the wake up pipe or event */
         picoquic_open_network_wake_up(thread_ctx, ret);
+        if (!thread_ctx->wake_up_defined) {
+            /* Wake-up initialization failed: fail closed. No thread was
+             * (or will be) started, so returning this context would hand
+             * the caller a zombie -- never ready, never closed, and still
+             * registered in the QUIC context. Undo the registration and
+             * free it; *ret carries the errno recorded by the open. */
+            if (*ret == 0) {
+                *ret = -1;
+            }
+            quic->v_thread_ctx = NULL;
+            free(thread_ctx);
+            thread_ctx = NULL;
+        }
         /* Start thread at specified entry point */
-        if (thread_ctx->wake_up_defined){
+        else {
             thread_ctx->is_threaded = 1;
             if (thread_create_fn == NULL) {
                 thread_create_fn = picoquic_internal_thread_create;
@@ -3090,10 +3153,19 @@ int picoquic_wake_up_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
             ret = (int)err;
         }
 #else
-        /* TODO: write to network pipe */
+        /* The write end is nonblocking (set at creation). EINTR is retried;
+         * EAGAIN/EWOULDBLOCK means the pipe is full, i.e. a wake byte is
+         * ALREADY pending and the loop will wake -- that is a successful
+         * wake, and it guarantees this call can never block teardown. */
         ssize_t written = 0;
-        if ((written = write(thread_ctx->wake_up_pipe_fd[1], &ret, 1)) != 1) {
-            if (written == 0) {
+        do {
+            written = write(thread_ctx->wake_up_pipe_fd[1], &ret, 1);
+        } while (written < 0 && errno == EINTR);
+        if (written != 1) {
+            if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                ret = 0;
+            }
+            else if (written == 0) {
                 ret = EPIPE;
             }
             else {
@@ -3109,23 +3181,39 @@ int picoquic_wake_up_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
     return ret;
 }
 
+/* Delete the network thread. The sequence is:
+*
+* 1- Set the should_close flag (release store), so the network thread
+*    knows the loop should stop.
+* 2- Wake up the network thread through the wake up pipe or event, so it
+*    notices the flag promptly. The wake up resources remain open, so the
+*    network thread never operates on a closed or recycled descriptor. If
+*    the wake up call fails, the loop still notices the flag when its
+*    socket wait times out (the loop never waits more than its maximum
+*    delay of 10 seconds).
+* 3- Join the network thread.
+* 4- Only then close the wake up resources and free the context, since
+*    at this point no other thread can access them.
+*/
 void picoquic_delete_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
 {
     /* set the should_close flag, so the thread knows the loop should stop */
-    thread_ctx->thread_should_close = 1;
-    /* Delete the wake up event. This ought to create a fault 
-     * in the wait for event call, causing the thread to wake up,
-     * notice the flag, and exit.
-     */
+    picoquic_thread_flag_set(&thread_ctx->thread_should_close, 1);
+
+    if (thread_ctx->is_threaded) {
+        /* Wake up the network thread, so it notices the flag and exits. */
+        (void)picoquic_wake_up_network_thread(thread_ctx);
+        /* Join the network thread before touching shared resources. */
+        thread_ctx->thread_delete_fn((void**)&thread_ctx->pthread);
+        thread_ctx->is_threaded = 0;
+    }
+    /* From here on the network thread is gone; the cleanup below is
+     * single threaded. */
     picoquic_close_network_wake_up(thread_ctx);
     /* Clear the thread context in the quic context, to avoid any risk of
      * use after free. */
     if (thread_ctx->quic != NULL) {
         thread_ctx->quic->v_thread_ctx = NULL;
-    }
-    /* delete the thread */
-    if (thread_ctx->is_threaded) {
-        thread_ctx->thread_delete_fn((void**)&thread_ctx->pthread);
     }
     /* If the param component was allocated as part of frame context, free it */
     if (thread_ctx->is_param_allocated) {
@@ -3133,6 +3221,18 @@ void picoquic_delete_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
     }
     /* Free the context */
     free(thread_ctx);
+}
+
+/* Thread safe accessors for the network thread lifecycle flags. See
+* picoquic_packet_loop.h for the synchronization and ordering contract. */
+int picoquic_network_thread_is_ready(picoquic_network_thread_ctx_t const* thread_ctx)
+{
+    return picoquic_thread_flag_get(&thread_ctx->thread_is_ready);
+}
+
+int picoquic_network_thread_is_closed(picoquic_network_thread_ctx_t const* thread_ctx)
+{
+    return picoquic_thread_flag_get(&thread_ctx->thread_is_closed);
 }
 
 

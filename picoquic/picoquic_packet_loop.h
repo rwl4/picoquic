@@ -242,13 +242,38 @@ void* picoquic_packet_loop_v3(void* v_ctx);
 * in this context without worrying about concurrency issues.
 * 
 * If the application wants to close the network thread, it calls
-* picoquic_close_network_thread, passing the thread context as an argument.
+* picoquic_delete_network_thread, passing the thread context as an argument.
 * The network thread context will be freed during that call.
 */
 typedef int (*picoquic_custom_thread_create_fn)(void** thread_id, picoquic_thread_fn thread_fn, void* arg);
 typedef void (*picoquic_custom_thread_setname_fn)(char const* thread_name);
 typedef void (*picoquic_custom_thread_delete_fn)(void** thread_id);
 
+/* Synchronization contract for the network thread context:
+*
+* The fields thread_is_ready, thread_should_close and thread_is_closed are
+* lifecycle flags shared between the network thread and the application
+* threads. Inside the library they are only accessed with atomic
+* operations (release stores, acquire loads). Application code running
+* concurrently with the network thread must not read these fields
+* directly; it should use the accessor functions
+* picoquic_network_thread_is_ready() and picoquic_network_thread_is_closed()
+* instead. (The volatile qualifier is kept for backwards compatibility;
+* volatile alone does not provide thread synchronization.)
+*
+* The return_code field is written by the network thread just before it
+* sets thread_is_closed. It is safe to read return_code after
+* picoquic_network_thread_is_closed() has returned 1, or in non-threaded
+* uses of picoquic_packet_loop_v3 in which the loop runs in the calling
+* thread.
+*
+* The wake up pipe or event is created before the network thread starts,
+* and is only closed by picoquic_delete_network_thread after the network
+* thread has been joined, so the thread can never observe a closed or
+* recycled descriptor. picoquic_wake_up_network_thread may be called from
+* any thread while the network thread is running, but not concurrently
+* with, or after, picoquic_delete_network_thread.
+*/
 typedef struct st_picoquic_network_thread_ctx_t {
     picoquic_quic_t* quic;
     picoquic_quic_t* qmux;
@@ -294,6 +319,36 @@ picoquic_network_thread_ctx_t* picoquic_start_network_thread_qmux(
 
 int picoquic_wake_up_network_thread(picoquic_network_thread_ctx_t* thread_ctx);
 void picoquic_delete_network_thread(picoquic_network_thread_ctx_t* thread_ctx);
+
+/* Thread safe accessors for the network thread lifecycle flags. Both are
+* acquire loads, pairing with the release stores performed by the packet
+* loop.
+*
+* picoquic_network_thread_is_ready:
+* - returns 1: the packet loop finished initializing its sockets and
+*   entered its waiting loop; picoquic_wake_up_network_thread will be
+*   noticed promptly. All loop initialization performed before the flag
+*   was set is visible to the caller.
+* - returns 0: the loop is either not yet initialized, failed to
+*   initialize, or has already exited (the flag is cleared when the loop
+*   leaves its waiting loop). A 0 result therefore does not distinguish
+*   "not yet ready" from "already terminated"; callers that need the
+*   distinction should also poll picoquic_network_thread_is_closed.
+*
+* picoquic_network_thread_is_closed:
+* - returns 1: the packet loop has exited, e.g. after a loop callback
+*   returned PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP or after a startup
+*   failure. Everything the loop wrote before exiting is visible to the
+*   caller; in particular the return_code field is stable and may be
+*   read directly (0 for normal termination, an error code otherwise).
+*   The network thread itself may still be running its final
+*   instructions, so the context must still be released through
+*   picoquic_delete_network_thread, which joins the thread.
+* - returns 0: the loop has not exited yet (or not started); return_code
+*   is not meaningful yet.
+*/
+int picoquic_network_thread_is_ready(picoquic_network_thread_ctx_t const* thread_ctx);
+int picoquic_network_thread_is_closed(picoquic_network_thread_ctx_t const* thread_ctx);
 
 /* The function picoquic_start_network_thread creates a background thread using
 * the "native" threading APIs, CreateThread in Windows or pthread_create in

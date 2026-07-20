@@ -32,6 +32,13 @@
 #include "picoqmux.h"
 
 
+/* POSIX headers required by the wake-saturation and wake-init-failure
+ * tests, independent of how SLEEP is provided. */
+#ifndef _WINDOWS
+#include <fcntl.h>
+#include <sys/resource.h>
+#endif
+
 #ifndef SLEEP
 #ifdef _WINDOWS
 #define SLEEP(x) Sleep(x)
@@ -551,7 +558,7 @@ int sockloop_test_one(sockloop_test_spec_t *spec)
                 }
                 else {
                     for (int i = 0; i < 2000; i++) {
-                        if (thread_ctx->thread_is_ready) {
+                        if (picoquic_network_thread_is_ready(thread_ctx)) {
                             DBG_PRINTF("Thread is ready after %dms", i);
                             break;
                         }
@@ -559,7 +566,7 @@ int sockloop_test_one(sockloop_test_spec_t *spec)
                             SLEEP(1);
                         }
                     }
-                    if (!thread_ctx->thread_is_ready) {
+                    if (!picoquic_network_thread_is_ready(thread_ctx)) {
                         DBG_PRINTF("%s", "Cannot start the network thread in 2000ms");
                         ret = -1;
                     }
@@ -568,9 +575,14 @@ int sockloop_test_one(sockloop_test_spec_t *spec)
                         ret = -1;
                     }
                     else {
+                        /* The loop callback requests the loop termination
+                         * once the scenario data has been received, so wait
+                         * until the network thread reports that the loop is
+                         * closed. The test context is only examined after
+                         * the thread is deleted, i.e. joined. */
                         for (int i = 0; i < 50; i++) {
-                            if (sockloop_test_received_finished(test_ctx)) {
-                                DBG_PRINTF("Receive finished after %dms", 100 * i);
+                            if (picoquic_network_thread_is_closed(thread_ctx)) {
+                                DBG_PRINTF("Thread closed after %dms", 100 * i);
                                 break;
                             }
                             else {
@@ -740,6 +752,388 @@ int sockloop_thread_name_test(void)
     return(sockloop_test_one(&spec));
 }
 
+/* Test of the network thread lifecycle: start / ready / wake / delete.
+*
+* The test verifies that the background thread teardown is safe in the
+* two situations that applications can create:
+*
+* - the application deletes the thread while the packet loop is parked
+*   inside the socket wait (no traffic at all), which exercises the
+*   "wake up and join before closing the wake up resources" path;
+* - the loop callback requests termination (returning
+*   PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP on wake up), after which the
+*   application observes the "thread is closed" flag and the loop return
+*   code before deleting the thread context.
+*
+* The immediate delete case is repeated several times to increase the
+* variety of thread interleavings. The test is expected to run under
+* thread sanitizer in the CI, so it documents the absence of data races
+* in the start/ready/wake/delete sequence.
+*/
+typedef struct st_sockloop_stop_test_ctx_t {
+    int stop_on_wake; /* Set before the thread starts, constant afterwards */
+    int spin_on_time_check; /* Set before the thread starts, constant afterwards */
+} sockloop_stop_test_ctx_t;
+
+static int sockloop_stop_test_cb(picoquic_quic_t* UNUSED(quic), picoquic_packet_loop_cb_enum cb_mode,
+    void* callback_ctx, void* callback_arg)
+{
+    int ret = 0;
+    sockloop_stop_test_ctx_t* stop_ctx = (sockloop_stop_test_ctx_t*)callback_ctx;
+
+    if (stop_ctx == NULL) {
+        ret = PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+    else if (cb_mode == picoquic_packet_loop_ready && stop_ctx->spin_on_time_check) {
+        picoquic_packet_loop_options_t* options = (picoquic_packet_loop_options_t*)callback_arg;
+        options->do_time_check = 1;
+    }
+    else if (cb_mode == picoquic_packet_loop_time_check && stop_ctx->spin_on_time_check) {
+        /* Keep the loop iterating with a zero delay, so the delete call
+         * races with a running loop instead of a parked one. */
+        packet_loop_time_check_arg_t* time_check_arg = (packet_loop_time_check_arg_t*)callback_arg;
+        time_check_arg->delta_t = 0;
+    }
+    else if (cb_mode == picoquic_packet_loop_wake_up && stop_ctx->stop_on_wake) {
+        ret = PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+    }
+    return ret;
+}
+
+static int sockloop_stop_test_wait_ready(picoquic_network_thread_ctx_t* thread_ctx)
+{
+    int ret = 0;
+
+    for (int i = 0; i < 2000; i++) {
+        if (picoquic_network_thread_is_ready(thread_ctx)) {
+            break;
+        }
+        else {
+            SLEEP(1);
+        }
+    }
+    if (!picoquic_network_thread_is_ready(thread_ctx)) {
+        DBG_PRINTF("%s", "Cannot start the network thread in 2000ms");
+        ret = -1;
+    }
+    return ret;
+}
+
+static int sockloop_stop_test_one(picoquic_quic_t* quic, sockloop_stop_test_ctx_t* stop_ctx,
+    picoquic_packet_loop_param_t* param, int use_custom_thread)
+{
+    int ret = 0;
+    picoquic_network_thread_ctx_t* thread_ctx = NULL;
+
+    if (use_custom_thread) {
+        thread_ctx = picoquic_start_custom_network_thread(quic, param,
+            picoquic_internal_thread_create, picoquic_internal_thread_delete,
+            picoquic_internal_thread_setname, "sockloop_stop", sockloop_stop_test_cb, stop_ctx, &ret);
+    }
+    else {
+        thread_ctx = picoquic_start_network_thread(quic, param, sockloop_stop_test_cb, stop_ctx, &ret);
+    }
+    if (thread_ctx == NULL) {
+        if (ret == 0) {
+            ret = -1;
+        }
+    }
+    else {
+        ret = sockloop_stop_test_wait_ready(thread_ctx);
+
+        if (ret == 0 && stop_ctx->stop_on_wake) {
+            /* Ask the loop to terminate itself, then wait until the
+             * thread reports that the loop is closed, and verify the
+             * loop return code. */
+            if (picoquic_wake_up_network_thread(thread_ctx) != 0) {
+                DBG_PRINTF("%s", "Cannot wakeup the network thread");
+                ret = -1;
+            }
+            else {
+                for (int i = 0; i < 2000; i++) {
+                    if (picoquic_network_thread_is_closed(thread_ctx)) {
+                        break;
+                    }
+                    else {
+                        SLEEP(1);
+                    }
+                }
+                if (!picoquic_network_thread_is_closed(thread_ctx)) {
+                    DBG_PRINTF("%s", "Network thread did not close in 2000ms");
+                    ret = -1;
+                }
+                else if (thread_ctx->return_code != 0) {
+                    /* Reading return_code is safe after the closed flag
+                     * has been observed. */
+                    DBG_PRINTF("Network thread closed with return code %d", thread_ctx->return_code);
+                    ret = -1;
+                }
+            }
+        }
+        if (ret == 0 && !stop_ctx->stop_on_wake) {
+            /* Wake the loop, then delete the thread right away. The
+             * delete call races with the loop iteration triggered by
+             * the wake up, and with the loop parking itself again in
+             * the socket wait. */
+            if (picoquic_wake_up_network_thread(thread_ctx) != 0) {
+                DBG_PRINTF("%s", "Cannot wakeup the network thread");
+                ret = -1;
+            }
+        }
+        picoquic_delete_network_thread(thread_ctx);
+    }
+    return ret;
+}
+
+int sockloop_thread_stop_test(void)
+{
+    int ret = 0;
+    picoquic_quic_t* quic = NULL;
+    picoquic_packet_loop_param_t param = { 0 };
+
+    param.local_port = 3459;
+    param.local_af = AF_INET6;
+    param.socket_buffer_size = PICOQUIC_MAX_PACKET_SIZE;
+
+    /* Create a pro-forma QUIC context, sufficient to run the packet loop. */
+    quic = picoquic_create(8,
+        NULL, NULL, NULL,
+        PICOQUIC_TEST_ALPN, NULL, NULL, NULL, NULL, NULL,
+        0, NULL, NULL, NULL, 0);
+    if (quic == NULL) {
+        ret = -1;
+    }
+    else {
+        /* Delete the thread while the loop is parked in the socket wait.
+         * Repeat, to vary the interleaving of the loop and of the delete
+         * call. */
+        for (int i = 0; ret == 0 && i < 8; i++) {
+            sockloop_stop_test_ctx_t stop_ctx = { 0 };
+            stop_ctx.spin_on_time_check = (i >= 4);
+            ret = sockloop_stop_test_one(quic, &stop_ctx, &param, i & 1);
+            if (ret != 0) {
+                DBG_PRINTF("Immediate delete iteration %d fails", i);
+            }
+        }
+        /* Terminate the loop from the wake up callback, check the
+         * closed flag and the return code, then delete the thread. */
+        if (ret == 0) {
+            sockloop_stop_test_ctx_t stop_ctx = { 0 };
+            stop_ctx.stop_on_wake = 1;
+            ret = sockloop_stop_test_one(quic, &stop_ctx, &param, 0);
+            if (ret != 0) {
+                DBG_PRINTF("%s", "Callback terminated delete fails");
+            }
+        }
+        picoquic_free(quic);
+    }
+    return ret;
+}
+
+/* Wake-channel saturation: teardown must never block on a full wake pipe.
+* The wake pipe's WRITE end is nonblocking by construction; that flag is
+* asserted first, as the fail-fast RED discriminator (with a blocking
+* write end, the saturation fill below would hang instead of failing).
+* The loop is then terminated through its callback -- after which nothing
+* ever drains the pipe again -- the pipe is filled until EAGAIN, and both
+* a wake against the saturated channel and the delete must still succeed:
+* a full pipe means a wake byte is already pending, which IS a wake.
+*/
+int sockloop_wake_saturation_test(void)
+{
+#ifdef _WINDOWS
+    /* Event-object wakes cannot saturate; the pipe path is POSIX-only. */
+    return 0;
+#else
+    int ret = 0;
+    picoquic_quic_t* quic = NULL;
+    picoquic_packet_loop_param_t param = { 0 };
+
+    param.local_port = 3460;
+    param.local_af = AF_INET6;
+    param.socket_buffer_size = PICOQUIC_MAX_PACKET_SIZE;
+
+    quic = picoquic_create(8,
+        NULL, NULL, NULL,
+        PICOQUIC_TEST_ALPN, NULL, NULL, NULL, NULL, NULL,
+        0, NULL, NULL, NULL, 0);
+    if (quic == NULL) {
+        ret = -1;
+    }
+    else {
+        sockloop_stop_test_ctx_t stop_ctx = { 0 };
+        picoquic_network_thread_ctx_t* thread_ctx = NULL;
+
+        stop_ctx.stop_on_wake = 1;
+        thread_ctx = picoquic_start_network_thread(quic, &param,
+            sockloop_stop_test_cb, &stop_ctx, &ret);
+        if (thread_ctx == NULL) {
+            if (ret == 0) {
+                ret = -1;
+            }
+        }
+        else {
+            ret = sockloop_stop_test_wait_ready(thread_ctx);
+
+            /* RED discriminator: the wake write end must be nonblocking. */
+            if (ret == 0) {
+                int flags = fcntl(thread_ctx->wake_up_pipe_fd[1], F_GETFL, 0);
+                if (flags < 0 || (flags & O_NONBLOCK) == 0) {
+                    DBG_PRINTF("%s", "Wake pipe write end is blocking");
+                    ret = -1;
+                }
+            }
+            /* Terminate the loop via its callback, so the wake pipe is
+             * never drained again. */
+            if (ret == 0) {
+                if (picoquic_wake_up_network_thread(thread_ctx) != 0) {
+                    DBG_PRINTF("%s", "Cannot wake the network thread");
+                    ret = -1;
+                }
+                else {
+                    for (int i = 0; i < 2000; i++) {
+                        if (picoquic_network_thread_is_closed(thread_ctx)) {
+                            break;
+                        }
+                        else {
+                            SLEEP(1);
+                        }
+                    }
+                    if (!picoquic_network_thread_is_closed(thread_ctx)) {
+                        DBG_PRINTF("%s", "Network thread did not close in 2000ms");
+                        ret = -1;
+                    }
+                }
+            }
+            /* Fill the wake channel to saturation. The write end is
+             * nonblocking, so this terminates with EAGAIN, never a block. */
+            if (ret == 0) {
+                ssize_t written = 1;
+                int fills = 0;
+                uint8_t b = 0;
+
+                while (fills < 0x40000) {
+                    written = write(thread_ctx->wake_up_pipe_fd[1], &b, 1);
+                    if (written != 1) {
+                        break;
+                    }
+                    fills++;
+                }
+                if (written == 1) {
+                    DBG_PRINTF("Wake pipe absorbed %d bytes without filling", fills);
+                    ret = -1;
+                }
+                else if (!(written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+                    DBG_PRINTF("Saturating write fails, errno %d", errno);
+                    ret = -1;
+                }
+                else if (fills == 0) {
+                    DBG_PRINTF("%s", "Wake pipe was already full after closure");
+                    ret = -1;
+                }
+            }
+            /* A wake against the saturated channel is a SUCCESSFUL wake:
+             * a byte is already pending. */
+            if (ret == 0 && picoquic_wake_up_network_thread(thread_ctx) != 0) {
+                DBG_PRINTF("%s", "Wake on saturated pipe reported failure");
+                ret = -1;
+            }
+            /* Delete must complete: its own wake hits the full pipe
+             * (EAGAIN = success), the join is immediate, and the wake
+             * resources are closed only after the join. Reaching the
+             * next statement IS the proof of non-blocking teardown. */
+            picoquic_delete_network_thread(thread_ctx);
+        }
+        picoquic_free(quic);
+    }
+    return ret;
+#endif
+}
+
+/* Wake initialization failure must fail CLOSED: when the wake pipe cannot
+* be created, picoquic_start_network_thread must return NULL with a nonzero
+* error, must NOT leave a zombie context registered in the QUIC context,
+* and a later start on the same QUIC context must still work. The fault is
+* injected without any test seam by dropping RLIMIT_NOFILE to zero, which
+* makes pipe() fail with EMFILE while everything already open keeps
+* working. POSIX only (the Windows path creates an event, not a pipe).
+*/
+int sockloop_wake_init_failure_test(void)
+{
+#ifdef _WINDOWS
+    return 0;
+#else
+    int ret = 0;
+    picoquic_quic_t* quic = NULL;
+    picoquic_packet_loop_param_t param = { 0 };
+    struct rlimit saved_limit;
+
+    param.local_port = 3461;
+    param.local_af = AF_INET6;
+    param.socket_buffer_size = PICOQUIC_MAX_PACKET_SIZE;
+
+    quic = picoquic_create(8,
+        NULL, NULL, NULL,
+        PICOQUIC_TEST_ALPN, NULL, NULL, NULL, NULL, NULL,
+        0, NULL, NULL, NULL, 0);
+    if (quic == NULL) {
+        ret = -1;
+    }
+    else if (getrlimit(RLIMIT_NOFILE, &saved_limit) != 0) {
+        DBG_PRINTF("%s", "Cannot read RLIMIT_NOFILE");
+        ret = -1;
+    }
+    else {
+        struct rlimit no_files = saved_limit;
+        int start_ret = 0;
+        picoquic_network_thread_ctx_t* thread_ctx = NULL;
+
+        no_files.rlim_cur = 0;
+        if (setrlimit(RLIMIT_NOFILE, &no_files) != 0) {
+            DBG_PRINTF("%s", "Cannot drop RLIMIT_NOFILE");
+            ret = -1;
+        }
+        else {
+            sockloop_stop_test_ctx_t stop_ctx = { 0 };
+            thread_ctx = picoquic_start_network_thread(quic, &param,
+                sockloop_stop_test_cb, &stop_ctx, &start_ret);
+            /* Restore the limit before any verdict. */
+            if (setrlimit(RLIMIT_NOFILE, &saved_limit) != 0) {
+                DBG_PRINTF("%s", "Cannot restore RLIMIT_NOFILE");
+                ret = -1;
+            }
+            if (thread_ctx != NULL) {
+                DBG_PRINTF("%s", "Start returned a context without a wake channel");
+                picoquic_delete_network_thread(thread_ctx);
+                ret = -1;
+            }
+            else if (start_ret == 0) {
+                DBG_PRINTF("%s", "Start failed but reported success");
+                ret = -1;
+            }
+            else if (quic->v_thread_ctx != NULL) {
+                DBG_PRINTF("%s", "Zombie thread context left in the QUIC context");
+                ret = -1;
+            }
+            /* The QUIC context must remain usable: a normal start/stop
+             * cycle must succeed after the injected failure. */
+            if (ret == 0) {
+                sockloop_stop_test_ctx_t stop_ctx2 = { 0 };
+                stop_ctx2.stop_on_wake = 1;
+                ret = sockloop_stop_test_one(quic, &stop_ctx2, &param, 0);
+                if (ret != 0) {
+                    DBG_PRINTF("%s", "Recovery start after wake failure fails");
+                }
+            }
+        }
+    }
+    if (quic != NULL) {
+        picoquic_free(quic);
+    }
+    return ret;
+#endif
+}
+
 /* Add tests of a QMUX loop. */
 uint8_t sockloop_qmux_test_data[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,14, 15, 16
@@ -755,7 +1149,10 @@ typedef struct st_sockloop_qmux_test_t {
     int test_bad_port;
     int test_close;
     int test_idle;
-    /* variables used to monitor execution */
+    /* variables used to monitor execution. ready_seen is written by the
+     * loop callback on the network thread and only read by the main
+     * thread after the network thread has been deleted, i.e. joined. */
+    int ready_seen;
     picoquic_packet_loop_param_t* param;
     int received_stream_0;
     uint64_t stream_0_length_received;
@@ -877,6 +1274,7 @@ int sockloop_qmux_test_cb(picoquic_quic_t* UNUSED(quic), picoquic_packet_loop_cb
         case picoquic_packet_loop_ready: {
             picoquic_packet_loop_options_t* options = (picoquic_packet_loop_options_t*)callback_arg;
             options->do_time_check = 1;
+            sim_ctx->ready_seen = 1;
             fprintf(stdout, "Waiting for packets.\n");
             break;
         }
@@ -1007,37 +1405,79 @@ int sockloop_qmux_one(
                 }
             }
             else {
+                /* Wait for the loop to become ready. The loop may also
+                 * terminate very quickly after becoming ready (e.g. if the
+                 * qmux connection fails immediately), in which case the
+                 * ready flag is already cleared; the closed flag documents
+                 * that transition, and the callback supplied ready_seen
+                 * latch is verified after the join to prove that the loop
+                 * did reach the ready state. A loop that never initialized
+                 * fails the test. */
                 for (int i = 0; i < 2000; i++) {
-                    if (thread_ctx->thread_is_ready) {
-                        DBG_PRINTF("Thread is ready after %dms", i);
+                    if (picoquic_network_thread_is_ready(thread_ctx) ||
+                        picoquic_network_thread_is_closed(thread_ctx)) {
+                        DBG_PRINTF("Thread is ready or closed after %dms", i);
                         break;
                     }
                     else {
                         SLEEP(1);
                     }
                 }
-                if (!thread_ctx->thread_is_ready) {
+                if (!picoquic_network_thread_is_ready(thread_ctx) &&
+                    !picoquic_network_thread_is_closed(thread_ctx)) {
                     DBG_PRINTF("%s", "Cannot start the network thread in 2000ms");
                     ret = -1;
                 }
                 else if (picoquic_wake_up_network_thread(thread_ctx) != 0) {
+                    /* The wake up pipe or event stays open until the thread
+                     * context is deleted, so this works even if the loop
+                     * already terminated. */
                     DBG_PRINTF("%s", "Cannot wakeup the network thread");
                     ret = -1;
                 }
                 else {
-                    if (spec->test_bad_port) {
-                        /* we merely check that the connection was properly terminated */
-                        ret = 0;
-                    }
-                    else {
-                        if (!spec->received_stream_0 ||
-                            !spec->stream_0_fin_received ||
-                            !spec->stream_0_data_matches) {
-                            ret = -1;
+                    /* The loop callback requests the loop termination once
+                     * the qmux connection completes or fails, so wait until
+                     * the network thread reports that the loop is closed,
+                     * then verify that the loop terminated cleanly. */
+                    int is_closed = 0;
+                    for (int i = 0; i < 100; i++) {
+                        if (picoquic_network_thread_is_closed(thread_ctx)) {
+                            is_closed = 1;
+                            break;
+                        }
+                        else {
+                            SLEEP(100);
                         }
                     }
+                    if (!is_closed) {
+                        DBG_PRINTF("%s", "Network thread did not close in 10s");
+                        ret = -1;
+                    }
+                    else if (thread_ctx->return_code != 0) {
+                        /* Reading return_code is safe after the closed
+                         * flag has been observed. */
+                        DBG_PRINTF("Network thread closed with return code %d", thread_ctx->return_code);
+                        ret = -1;
+                    }
                 }
+                /* Deleting the network thread joins it, so the results
+                 * written by the loop callback can be safely examined
+                 * after this call. */
                 picoquic_delete_network_thread(thread_ctx);
+                if (ret == 0 && !spec->ready_seen) {
+                    /* The loop never reached the ready state: the thread
+                     * failed to initialize. */
+                    DBG_PRINTF("%s", "Network thread never reached the ready state");
+                    ret = -1;
+                }
+                if (ret == 0 && !spec->test_bad_port) {
+                    if (!spec->received_stream_0 ||
+                        !spec->stream_0_fin_received ||
+                        !spec->stream_0_data_matches) {
+                        ret = -1;
+                    }
+                }
             }
         }
         else {
@@ -1095,6 +1535,21 @@ int sockloop_qmux_badp_test(void)
     sockloop_qmux_test_t spec;
     sockloop_test_set_qmux_spec(&spec, 1);
     spec.test_bad_port = 1;
+
+    return(sockloop_qmux_one(&spec));
+}
+
+/* Run the QMUX loop in a background thread, then delete the thread.
+* The "bad port" variant is used because it does not require waiting
+* for a data transfer: the test verifies the start / ready / wake /
+* delete sequence of the background thread on the QMUX code path. */
+int sockloop_qmux_thread_test(void)
+{
+    sockloop_qmux_test_t spec;
+    sockloop_test_set_qmux_spec(&spec, 1);
+    spec.test_bad_port = 1;
+    spec.use_background_thread = 1;
+    spec.thread_name = "sockloop_qmux";
 
     return(sockloop_qmux_one(&spec));
 }
